@@ -24,6 +24,7 @@ from ipmgr.db.worker import DBBusyError, DBConnectionError, DBWorker
 from ipmgr.logic import excel_export
 from ipmgr.logic.subnet_calc import natural_key, usage_level, usage_percent
 from ipmgr.models import group_model, integrity_model, ip_model, subnet_model
+from ipmgr.db.schema import SchemaTooNewError
 from ipmgr.models.common import AppError, ConflictError
 from ipmgr.ui.bulk_form import AssignDialog, GroupDialog, ReclaimDialog, SubnetDialog, SubnetEditDialog
 from ipmgr.ui.crud_form import IPEditDialog
@@ -343,6 +344,7 @@ class MainWindow:
         self._ip_select_job: str | None = None
         self._bg_results: queue.Queue[tuple[Callable[[Any], None], Any]] = queue.Queue()
         self._last_conn_error = 0.0
+        self._closing_for_upgrade = False
         self.integrity_report: integrity_model.Report | None = None
         self._integrity_running = False
         self._integrity_alerted = False
@@ -459,7 +461,9 @@ class MainWindow:
     def show_error(self, exc: BaseException) -> None:
         """Worker 오류를 사용자에게 안내한다."""
         self.set_busy(False)
-        if isinstance(exc, ConflictError):
+        if isinstance(exc, SchemaTooNewError):
+            self._schema_too_new(exc)
+        elif isinstance(exc, ConflictError):
             messagebox.showwarning("충돌 감지", str(exc), parent=self.root)
             self.refresh_all()
         elif isinstance(exc, AppError):
@@ -1146,6 +1150,9 @@ class MainWindow:
 
         def failed(exc: BaseException) -> None:
             self._quick_inflight = False
+            if isinstance(exc, SchemaTooNewError):
+                self._schema_too_new(exc)
+                return
             log.warning("빠른 무결성 검사 실패: %s", exc)
 
         self.worker.submit(integrity_model.quick_check, self.anchor_path, on_success=done, on_error=failed,
@@ -1191,11 +1198,23 @@ class MainWindow:
 
         def failed(exc: BaseException) -> None:
             self._integrity_running = False
+            if isinstance(exc, SchemaTooNewError):
+                self._schema_too_new(exc)
+                return
             self._set_integrity_label("🛡 무결성 검사 실패", "warning")
             log.error("무결성 기준 검사 오류", exc_info=exc)
 
         self.run_background(lambda: integrity_model.full_check(self.db_path, self.anchor_path, progress),
                             done, failed)
+
+    def _schema_too_new(self, exc: SchemaTooNewError) -> None:
+        """다른 사용자가 새 버전 프로그램으로 DB를 업데이트함 → 안내 후 종료(구버전은 DB를 건드리지 않음)."""
+        if self._closing_for_upgrade:
+            return
+        self._closing_for_upgrade = True
+        log.warning("DB가 더 새 버전으로 업데이트됨: v%s", exc.db_version)
+        messagebox.showwarning("새 버전 필요", str(exc), parent=self.root)
+        self.root.destroy()
 
     def _on_integrity_problem(self, report: integrity_model.Report) -> None:
         self.integrity_report = report

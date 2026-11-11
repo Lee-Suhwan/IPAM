@@ -138,9 +138,36 @@ TRIGGER_NAMES = ("trg_ips_insert", "trg_ips_delete", "trg_ips_status") + WATCH_T
 RANGE_LOOKBACK = 2 ** (32 - MIN_SUBNET_PREFIX)
 
 
+class SchemaTooNewError(Exception):
+    """DB가 이 프로그램보다 새 버전 프로그램으로 이미 변환됨 → 구버전 프로그램은 DB를 건드리지 않는다."""
+
+    def __init__(self, db_version: int) -> None:
+        super().__init__(f"이 DB는 더 새로운 버전의 IP관리 프로그램으로 업데이트되었습니다 "
+                         f"(DB 구조 v{db_version}, 이 프로그램 v{SCHEMA_VERSION}).\n\n"
+                         "공유 폴더의 최신 IP관리.exe로 다시 실행해 주세요.\n"
+                         "(구버전으로 계속 사용하면 새 구조를 '변조'로 잘못 판단할 수 있어 차단합니다)")
+        self.db_version = db_version
+
+
+def ensure_not_newer(conn: sqlite3.Connection) -> None:
+    """DB 구조 버전이 이 프로그램보다 높으면 SchemaTooNewError(연결 시·무결성 검사 시마다 확인)."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return                                      # 아직 스키마가 없는 새 DB
+    if row is not None and row[0] > SCHEMA_VERSION:
+        raise SchemaTooNewError(row[0])
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
-    """테이블/인덱스/트리거를 생성하고 meta 기본값을 채운다(멱등)."""
+    """테이블/인덱스/트리거를 생성하고 meta 기본값을 채운다(멱등).
+
+    프로그램을 수정·재빌드해도 DB는 그대로 쓴다. 구조가 바뀐 버전(SCHEMA_VERSION 증가)이 처음 열 때만
+    컬럼 추가·트리거 교체 같은 변환을 1회 수행하고, 더 새 버전이 변환한 DB는 열지 않는다.
+    """
+    ensure_not_newer(conn)
     with transaction(conn):
+        ensure_not_newer(conn)                      # 잠금을 잡은 뒤 한 번 더(동시 실행 대비)
         fresh = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'meta'").fetchone() is None
         for statement in _split(TABLES_SQL):
             conn.execute(statement)
@@ -148,10 +175,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
                          [("schema_version", SCHEMA_VERSION), ("data_rev", 0), ("tree_rev", 0), ("app_write", 0),
                           ("baseline", 1 if fresh else 0)])
         conn.execute("UPDATE meta SET value = 1 WHERE key = 'app_write'")     # 이 트랜잭션의 쓰기는 프로그램 작업
+        version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
         _migrate_nullable_group(conn)
         _ensure_hash_columns(conn)
+        if not fresh and version < SCHEMA_VERSION:
+            # 구조가 바뀐 새 버전이 처음 열 때: 예전 버전의 트리거를 이 버전의 정의로 교체
+            # (IF NOT EXISTS만으로는 예전 정의가 남아 '감시 장치 훼손'으로 오탐된다)
+            for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+                conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
         create_triggers(conn)
-        version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
         if version < 3 and not fresh:
             # v2 이하 → 기존 데이터 전체에 해시 체인/행 해시를 최초 1회 부여
             from ipmgr.models.integrity_model import seal_all

@@ -478,6 +478,79 @@ class TestMultilineNote(BaseDB):
         self.assertEqual(tsv_cell("plain"), "plain")
 
 
+def integrity_fingerprint() -> str:
+    """기존 DB의 해시·감시 장치와 맞아야 하는 '무결성 규칙' 전체의 지문.
+
+    트리거 정의, 해시에 들어가는 컬럼, 해시 계산식·키 중 하나라도 바뀌면 값이 달라진다.
+    """
+    import hashlib
+    from ipmgr.db.schema import TRIGGERS_SQL, WATCH_TRIGGERS_SQL
+    from ipmgr.models.history_model import HISTORY_COLUMNS
+    ig = integrity_ig
+    sample_ip = {"id": 167772161, "subnet_id": 1, "status": STATUS_USED, "hostname": "h", "allocated_date": "d",
+                 "assignee": "a", "request_no": "r", "note": "n\n2", "version": 2, "updated_at": "t", "updated_by": "u"}
+    parts = [" ".join((TRIGGERS_SQL + WATCH_TRIGGERS_SQL).split()), repr(ig.IP_FIELDS), repr(ig.SUBNET_FIELDS),
+             repr(ig.GROUP_FIELDS), repr(HISTORY_COLUMNS), ig.PRISTINE_SQL,
+             ig.chain_hash(ig.GENESIS, (1, "x", None, 3)).hex(), ig.ip_row_hash(sample_ip).hex(),
+             ig.subnet_row_hash({"id": 1, "group_id": None, "cidr": "10.0.0.0/24", "network_int": 1,
+                                 "broadcast_int": 2, "prefix": 24, "description": "d"}).hex(),
+             ig.group_row_hash({"id": 1, "parent_id": None, "name": "g", "description": ""}).hex(),
+             ig._anchor_mac(7, b"\x01" * 16)]
+    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+# DB 구조 버전별 무결성 규칙 지문. 규칙을 바꾸면 SCHEMA_VERSION을 올리고(필요하면 기존 DB 재봉인 변환 추가)
+# 여기에 새 버전의 지문을 추가한다. 이 테스트가 실패하면 build.bat도 중단되어 잘못된 EXE가 배포되지 않는다.
+INTEGRITY_FINGERPRINTS = {4: "dc809459f22e466e"}
+
+
+class TestRebuildCompatibility(BaseDB):
+    """프로그램을 수정·재빌드해도 기존 DB를 그대로 쓸 수 있는지."""
+
+    def test_integrity_rules_unchanged_for_this_schema_version(self) -> None:
+        from ipmgr.constants import SCHEMA_VERSION
+        self.assertEqual(
+            INTEGRITY_FINGERPRINTS.get(SCHEMA_VERSION), integrity_fingerprint(),
+            "무결성 규칙(트리거·해시 컬럼·해시 계산식·키)이 바뀌었습니다. 이대로 배포하면 기존 DB가 '변조'로 "
+            "오탐됩니다. SCHEMA_VERSION을 올리고, 해시 계산이 바뀌었다면 기존 DB 재봉인 변환을 추가한 뒤 "
+            "INTEGRITY_FINGERPRINTS에 새 값을 등록하세요.")
+
+    def test_new_version_replaces_old_trigger_definitions(self) -> None:
+        """구조가 바뀐 새 버전이 처음 열면 예전 버전의 트리거를 자기 정의로 교체 → 오탐 없음."""
+        from ipmgr.constants import SCHEMA_VERSION
+        anchor = Path(self.tmp.name) / "anchor"
+        self.make_subnet()
+        integrity_model.full_check(None, anchor, conn=self.conn)
+        # 예전 버전이 만든(정의가 다른) 감시 트리거가 남아 있는 DB
+        self.conn.execute("DROP TRIGGER trg_w_ips_upd")
+        self.conn.execute("CREATE TRIGGER trg_w_ips_upd AFTER UPDATE ON ips BEGIN "
+                          "INSERT OR IGNORE INTO dirty(kind, ref) VALUES (0, NEW.id); END")
+        self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (SCHEMA_VERSION - 1,))
+        init_schema(self.conn)                                  # 새 버전 EXE가 처음 연 상황
+        self.assertTrue(integrity_model.quick_check(self.conn, anchor).ok)
+        # 버전을 올리지 않은 채 트리거가 바뀌면(밖에서 고친 것) 그대로 감지
+        self.conn.execute("DROP TRIGGER trg_w_ips_upd")
+        self.conn.execute("CREATE TRIGGER trg_w_ips_upd AFTER UPDATE ON ips BEGIN SELECT 1; END")
+        init_schema(self.conn)
+        self.assertIn("watch", integrity_model.quick_check(self.conn, anchor).counts)
+
+    def test_older_program_refuses_db_upgraded_by_newer_version(self) -> None:
+        """구버전 EXE는 새 버전이 변환한 DB를 열지도, '복구'하지도 않는다(백업 원복 사고 방지)."""
+        from ipmgr.constants import SCHEMA_VERSION
+        from ipmgr.db.schema import SchemaTooNewError
+        bdir = Path(self.tmp.name) / "Backup"
+        self.make_subnet()
+        backup_mgr.refresh_good_backup(self.db_path, bdir, 0, OP, force=True)
+        self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (SCHEMA_VERSION + 1,))
+        with self.assertRaises(SchemaTooNewError):
+            init_schema(self.conn)
+        with self.assertRaises(SchemaTooNewError):
+            integrity_model.quick_check(self.conn, None)
+        with self.assertRaises(SchemaTooNewError):
+            integrity_model.recover(self.conn, None, bdir, OP)
+        self.assertEqual(list(bdir.glob("변조본_*.db")), [])     # 원복 시도조차 하지 않음
+
+
 class TestIntegrity(BaseDB):
     """위변조 감지와 복구."""
 

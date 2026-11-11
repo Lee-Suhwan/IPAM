@@ -33,7 +33,7 @@ from ipmgr.constants import (ACT_ALLOCATE, ACT_INTEGRITY_REPAIR, ACT_MODIFY, ACT
                              TAMPERED_PREFIX)
 from ipmgr.db.connection import create_connection, transaction
 from ipmgr.db.schema import (DIRTY_GROUP, DIRTY_HISTORY, DIRTY_IP, DIRTY_SUBNET, RANGE_LOOKBACK, TRIGGER_NAMES,
-                             WATCH_TRIGGER_NAMES)
+                             WATCH_TRIGGER_NAMES, ensure_not_newer)
 from ipmgr.logic import integrity as ig
 from ipmgr.logic.subnet_calc import int_to_ip
 from ipmgr.models.common import ValidationError, bump_revision, now_str
@@ -170,6 +170,7 @@ def check_anchor(conn: sqlite3.Connection, report: Report, anchor_path: Path | N
 def _quick_report(conn: sqlite3.Connection, anchor_path: Path | None) -> tuple[Report, ig.Anchor | None,
                                                                              list[tuple[int, int]]]:
     """빠른 검사 본체(부수 효과 없음): (결과, 기준값, 검증한 dirty 항목)."""
+    ensure_not_newer(conn)          # 새 버전 프로그램이 바꾼 구조를 구버전이 변조로 오판하지 않도록
     report = Report("quick")
     check_watch(conn, report)
     anchor = check_anchor(conn, report, anchor_path)
@@ -457,6 +458,7 @@ def full_check(db_path: Path | None, anchor_path: Path | None, progress: Progres
 
 
 def _full_report(conn: sqlite3.Connection, anchor_path: Path | None, progress: Progress | None = None) -> Report:
+    ensure_not_newer(conn)
     report = Report("full")
     if has_watch(conn):
         check_watch(conn, report)
