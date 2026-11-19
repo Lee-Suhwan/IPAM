@@ -90,6 +90,54 @@ def all_group_paths(conn: sqlite3.Connection) -> dict[int, str]:
     return {gid: path(gid) for gid in name}
 
 
+FIND_LIMIT = 50
+
+
+def find_nodes(conn: sqlite3.Connection, text: str, limit: int = FIND_LIMIT) -> dict[str, Any]:
+    """좌측 트리 검색: 그룹(이름)과 대역(CIDR 범위·설명)을 찾는다.
+
+    '192.168.10.' / '192.168.10.0/24' / '192.168.10.55' → 그 범위와 겹치는(그 IP를 담은) 대역
+    'DMZ' → 이름에 DMZ가 있는 그룹 + 설명·CIDR에 DMZ가 있는 대역. 결과마다 펼칠 조상 그룹 체인을 함께 준다.
+    """
+    from ipmgr.logic.subnet_calc import ip_prefix_range
+    query = (text or "").strip()
+    if not query:
+        return {"rows": [], "truncated": False}
+    groups = conn.execute("SELECT id, parent_id, name FROM groups").fetchall()
+    parent = {r["id"]: r["parent_id"] for r in groups}
+    paths = all_group_paths(conn)
+
+    def chain(gid: int | None) -> list[int]:
+        out, seen = [], set()
+        while gid is not None and gid not in seen and gid in parent:
+            seen.add(gid)
+            out.append(gid)
+            gid = parent[gid]
+        return list(reversed(out))
+
+    rows: list[dict[str, Any]] = []
+    rng = ip_prefix_range(query)
+    if rng:
+        subnets = conn.execute("SELECT id, group_id, cidr, description FROM subnets "
+                               "WHERE network_int <= ? AND broadcast_int >= ? ORDER BY network_int LIMIT ?",
+                               (rng[1], rng[0], limit + 1)).fetchall()
+    else:
+        key = query.lower()
+        for g in sorted(groups, key=lambda r: natural_key(paths.get(r["id"], ""))):
+            if key in g["name"].lower():
+                rows.append({"kind": "group", "id": g["id"], "label": g["name"], "path": paths.get(g["id"], ""),
+                             "chain": chain(g["parent_id"])})
+        like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        subnets = conn.execute("SELECT id, group_id, cidr, description FROM subnets "
+                               "WHERE description LIKE ? ESCAPE '\\' OR cidr LIKE ? ESCAPE '\\' "
+                               "ORDER BY network_int LIMIT ?", (like, like, limit + 1)).fetchall()
+    for s in subnets:
+        rows.append({"kind": "subnet", "id": s["id"], "label": s["cidr"], "description": s["description"],
+                     "path": paths.get(s["group_id"], NO_GROUP_LABEL) if s["group_id"] is not None else NO_GROUP_LABEL,
+                     "chain": chain(s["group_id"])})
+    return {"rows": rows[:limit], "truncated": len(rows) > limit}
+
+
 def descendant_ids(conn: sqlite3.Connection, group_id: int) -> list[int]:
     """자신을 포함한 모든 하위 그룹 ID."""
     return [r[0] for r in conn.execute(_DESC_CTE + "SELECT id FROM d", (group_id,))]

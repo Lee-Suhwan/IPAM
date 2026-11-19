@@ -36,10 +36,12 @@ class SubnetDashboard(ttk.Frame):
     """대역 사용률 요약 뷰."""
 
     def __init__(self, master: tk.Misc, theme: ThemeManager, *, on_open_subnet: Callable[[int], None],
-                 on_export: Callable[[], None], on_more: Callable[[bool], None]) -> None:
+                 on_export: Callable[[], None], on_more: Callable[[bool], None],
+                 on_context: Callable[[tk.Event, dict[str, Any] | None], None] | None = None) -> None:
         super().__init__(master, style="TFrame")
         self.theme = theme
         self.on_open_subnet = on_open_subnet
+        self.on_context = on_context
         self.on_more = on_more
         self._data: dict[str, Any] | None = None
         px = theme.px
@@ -57,8 +59,8 @@ class SubnetDashboard(ttk.Frame):
         self.title = ttk.Label(top, text="", style="SurfaceTitle.TLabel")
         self.title.grid(row=0, column=0, sticky="w")
         self.badge = ttk.Label(top, text="", style="Safe.Badge.TLabel")
-        self.badge.grid(row=0, column=1, sticky="e", padx=(px(8), px(8)))
-        ttk.Button(top, text="📊 Excel 내보내기", width=0, command=on_export).grid(row=0, column=2, sticky="e")
+        self.badge.grid(row=0, column=1, sticky="e", padx=(px(8), 0))
+        # Excel 내보내기는 툴바·트리 우클릭·Ctrl+E에서(화면 안 버튼 없음)
         self.subtitle = ttk.Label(card, text="", style="SurfaceMuted.TLabel")
         self.subtitle.grid(row=1, column=0, sticky="w", pady=(px(2), px(8)))
 
@@ -105,6 +107,7 @@ class SubnetDashboard(ttk.Frame):
 
         self.table.bind("<Double-Button-1>", self._open_from_table)
         self.table.bind("<Return>", self._open_from_table)
+        self.table.bind("<Button-3>", self._on_right_click)
         theme.register(self._apply_theme)
 
     # ── 테마 ──────────────────────────────────────────────
@@ -154,7 +157,7 @@ class SubnetDashboard(ttk.Frame):
         self.stat_labels["pct"].configure(text=f"{pct:.1f}%", foreground=self.theme.palette[level])
         self.progress.configure(value=pct, style=f"{level.title()}.Horizontal.TProgressbar")
         shown, count = len(data["subnets"]), stats["subnet_count"]
-        self.notice.configure(text=f"대역 {count:,}개 · 더블클릭하면 IP 목록으로 이동합니다.")
+        self.notice.configure(text=f"대역 {count:,}개 · 더블클릭: IP 목록으로 이동 · 우클릭: 수정 · 삭제")
         if count > shown:
             self.more_label.configure(text=f"표시 {shown:,} / 전체 {count:,}")
             self.more_btn.configure(text=f"더 보기 (+{min(256, count - shown):,})")
@@ -185,6 +188,20 @@ class SubnetDashboard(ttk.Frame):
         if keep:
             t.selection_set(keep)
         t.yview_moveto(yview)
+
+    def subnet_of(self, iid: str) -> dict[str, Any] | None:
+        """표의 행 → 대역 정보."""
+        if not self._data or not iid:
+            return None
+        return next((s for s in self._data["subnets"] if str(s["id"]) == iid), None)
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        iid = self.table.identify_row(event.y)
+        if iid:
+            self.table.selection_set(iid)
+            self.table.focus(iid)
+        if self.on_context:
+            self.on_context(event, self.subnet_of(iid))
 
     def _open_from_table(self, _event: tk.Event) -> None:
         sel = self.table.selection()

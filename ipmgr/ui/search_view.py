@@ -1,19 +1,21 @@
-"""F3 / Ctrl+F 전체 이력 창(최신순) + 통합 검색(IP · 호스트네임 · 담당자 · 요청번호 · 비고).
+"""전체 이력 창(최신순) + 통합 검색(IP · 호스트네임 · 담당자 · 요청번호 · 비고), F3 / Ctrl+F IP 검색 창.
 
 검색 전에는 전체 최근 이력을 보여 준다. 처음에 RECENT_PAGE건만 읽고, 아래로 스크롤해 끝에 가까워질 때마다
 다음 RECENT_PAGE건을 이어 붙인다(이력이 수백만 건이어도 화면에 필요한 만큼만 조회).
 """
 from __future__ import annotations
 
+import re
 import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable
 
 from ipmgr.constants import SEARCH_LIMIT, STATUS_USED
 from ipmgr.db.worker import DBWorker
+from ipmgr.logic.subnet_calc import ip_to_int
 from ipmgr.models import history_model, ip_model
 from ipmgr.ui.theme_mgr import Palette, ThemeManager
-from ipmgr.ui.widgets import center_over, one_line, scrolled_tree
+from ipmgr.ui.widgets import FormDialog, center_over, one_line, scrolled_tree
 
 RECENT_PAGE = 200
 COLUMNS = (
@@ -34,9 +36,31 @@ RECENT_COLUMNS = (
     ("hostname", "호스트네임", 130, "w", True),
     ("assignee", "담당자", 80, "w", False),
     ("request_no", "요청번호", 100, "w", False),
-    ("operator", "작업자", 150, "w", False),
-    ("detail", "내용", 220, "w", True),
+    ("operator", "작업자", 150, "w", True),
 )
+
+
+_FULL_IP_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+
+class IPSearchDialog(FormDialog):
+    """F3 / Ctrl+F: IP 주소(네 자리 모두)를 입력하면 그 IP로 바로 이동."""
+
+    def __init__(self, parent: tk.Misc, theme: ThemeManager) -> None:
+        super().__init__(parent, theme, "IP 검색", ok_text="이동")
+
+    def build(self, body: ttk.Frame) -> None:
+        entry, self.ip_var = self.entry("", width=24)
+        self.add_row(0, "IP 주소", entry, hint="IP 주소 전체를 입력하세요 (예: 192.168.10.55)")
+
+    def validate(self) -> dict[str, Any]:
+        text = self.ip_var.get().strip()
+        if not _FULL_IP_RE.match(text):
+            raise ValueError("IP 주소 전체를 입력하세요 (예: 192.168.10.55).")
+        try:
+            return {"ip_id": ip_to_int(text), "ip": text}
+        except ValueError as exc:
+            raise ValueError(f"올바른 IP 주소가 아닙니다: {text}") from exc
 
 
 def _vscroll(frame: ttk.Frame) -> ttk.Scrollbar:
@@ -162,9 +186,10 @@ class SearchDialog(tk.Toplevel):
             change = (f"{r['old_status']} → {r['new_status']}" if r["old_status"] and r["new_status"]
                       and r["old_status"] != r["new_status"] else r["new_status"] or "")
             t.insert("", "end", iid=iid, tags=("used",) if r["new_status"] == STATUS_USED else (),
-                     values=(r["timestamp"], r["action"], r["ip_address"] or r["cidr"] or "", change,
-                             r["hostname"], r["assignee"], r["request_no"], r["operator"],
-                             one_line(r["diff_summary"], 200)))
+                     # 대상이 IP·대역이 아닌 작업(그룹 생성 등)은 대상 칸에 그 설명을 짧게 보여 준다
+                     values=(r["timestamp"], r["action"],
+                             r["ip_address"] or r["cidr"] or one_line(r["diff_summary"], 40), change,
+                             r["hostname"], r["assignee"], r["request_no"], r["operator"]))
             if r["nav"] is not None:
                 self._nav[iid] = r["nav"]
         if page["rows"]:

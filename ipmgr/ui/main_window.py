@@ -28,10 +28,11 @@ from ipmgr.db.schema import SchemaTooNewError
 from ipmgr.models.common import AppError, ConflictError
 from ipmgr.ui.bulk_form import AssignDialog, GroupDialog, ReclaimDialog, SubnetDialog, SubnetEditDialog
 from ipmgr.ui.crud_form import IPEditDialog
+from ipmgr.ui.help_view import HelpDialog
 from ipmgr.ui.history_view import HistoryTimeline
 from ipmgr.ui.import_form import ImportDialog, ImportPreviewDialog
 from ipmgr.utils import backup_mgr, path_helper
-from ipmgr.ui.search_view import SearchDialog
+from ipmgr.ui.search_view import IPSearchDialog, SearchDialog
 from ipmgr.ui.subnet_dashboard import SubnetDashboard
 from ipmgr.ui.theme_mgr import Palette, ThemeManager
 from ipmgr.ui.tree_view import Node, NetworkTree, node_iid
@@ -97,16 +98,8 @@ class SubnetView(ttk.Frame):
         self.title = ttk.Label(card, text="", style="SurfaceTitle.TLabel")
         self.title.grid(row=0, column=0, sticky="w")
         self.badge = ttk.Label(card, text="", style="Safe.Badge.TLabel")
-        self.badge.grid(row=0, column=1, sticky="e", padx=(px(8), px(8)))
-        actions = ttk.Frame(card, style="Surface.TFrame")
-        actions.grid(row=0, column=2, sticky="e")
-        ttk.Button(actions, text="✔ IP 등록", style="Accent.TButton", width=0,
-                   command=win.assign_selected).pack(side="left")
-        ttk.Button(actions, text="↩ IP 회수", width=0, command=win.reclaim_selected).pack(side="left", padx=(px(6), 0))
-        ttk.Button(actions, text="✎ 대역 수정", width=0, command=win.edit_node).pack(side="left", padx=(px(6), 0))
-        ttk.Button(actions, text="📥 불러오기", width=0, command=win.import_data).pack(side="left", padx=(px(6), 0))
-        ttk.Button(actions, text="📊 Excel 내보내기", width=0, command=win.export_excel).pack(side="left",
-                                                                                         padx=(px(6), 0))
+        self.badge.grid(row=0, column=1, sticky="e", padx=(px(8), 0))
+        # 버튼 없음: IP 등록·회수·수정은 목록 더블클릭·우클릭, 대역 수정은 트리 우클릭, 불러오기·Excel은 툴바
         self.subtitle = ttk.Label(card, text="", style="SurfaceMuted.TLabel")
         self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(px(2), px(6)))
         self.progress = ttk.Progressbar(card, maximum=100, style="Safe.Horizontal.TProgressbar")
@@ -287,13 +280,22 @@ class SubnetView(ttk.Frame):
         return "break"
 
     def _on_double_click(self, event: tk.Event) -> str | None:
-        """더블클릭: 미사용 → IP 등록, 사용중 → IP 회수."""
-        if self.grid_tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+        """더블클릭: 비고 칸 → 정보 수정, 그 밖의 칸 → 미사용은 IP 등록, 사용중은 IP 회수."""
+        g = self.grid_tree
+        if g.identify_region(event.x, event.y) not in ("cell", "tree"):
             return None
-        iid = self.grid_tree.identify_row(event.y)
+        iid = g.identify_row(event.y)
         if iid:
-            self.grid_tree.selection_set(iid)
-            self.win.open_action_for_selection([int(iid)])
+            g.selection_set(iid)
+            g.focus(iid)
+            column = g.identify_column(event.x)                  # '#1' 형식(표시 순서)
+            index = int(column.lstrip("#") or 0) - 1
+            names = g["displaycolumns"]
+            names = g["columns"] if names in ("#all", ("#all",)) else names
+            if 0 <= index < len(names) and names[index] == "note":
+                self.win.edit_selected_ip()
+            else:
+                self.win.open_action_for_selection([int(iid)])
         return "break"
 
     def _on_right_click(self, event: tk.Event) -> None:
@@ -367,11 +369,12 @@ class MainWindow:
 
         toolbar = ttk.Frame(root, style="Toolbar.TFrame", padding=(px(8), px(8)))
         toolbar.grid(row=0, column=0, sticky="ew")
+        # IP 등록·회수·수정은 IP 목록(더블클릭·우클릭), 그룹·대역 수정·삭제는 트리 우클릭·Del 키에서
         buttons = (("＋ 그룹", self.add_group), ("＋ 대역", self.add_subnet), None,
-                   ("✔ IP 등록", self.assign_selected), ("↩ IP 회수", self.reclaim_selected), None,
-                   ("✎ 수정", self.edit_action), ("🗑 삭제", self.delete_node), None,
-                   ("🕘 전체 이력 (F3)", self.open_search), ("📥 불러오기", self.import_data),
-                   ("📊 Excel 내보내기", self.export_excel), ("⟳ 새로고침 (F5)", self.refresh_all))
+                   ("🔍 IP 검색 (F3)", self.open_ip_search), ("🕘 전체 이력", self.open_search),
+                   ("📥 불러오기", self.import_data),
+                   ("📊 Excel 내보내기", self.export_excel), ("⟳ 새로고침 (F5)", self.refresh_all),
+                   ("❔ 도움말 (F1)", self.open_help))
         for spec in buttons:
             if spec is None:
                 ttk.Frame(toolbar, style="Divider.TFrame", width=1).pack(side="left", fill="y", padx=px(8),
@@ -411,7 +414,8 @@ class MainWindow:
         ttk.Button(starters, text="＋ 그룹 만들기", width=0,
                    command=lambda: self.add_group(top_level=True)).pack(side="left", padx=(px(8), 0))
         self.dashboard = SubnetDashboard(self.right, self.theme, on_open_subnet=self.open_subnet,
-                                         on_export=self.export_excel, on_more=self.more_dashboard)
+                                         on_export=self.export_excel, on_more=self.more_dashboard,
+                                         on_context=self.on_dashboard_context)
         self.subnet_view = SubnetView(self.right, self.theme, self)
         for view in (self.empty_view, self.dashboard, self.subnet_view):
             view.grid(row=0, column=0, sticky="nsew")
@@ -525,9 +529,10 @@ class MainWindow:
             self.run_quick_check()          # 프로그램 밖 수정 흔적 → 검증(이미 경고 중이면 생략)
 
     def refresh_all(self) -> None:
-        """수동 새로고침(F5)."""
+        """수동 새로고침(F5): 화면을 다시 읽고 DB 확인(동기화 시각)도 바로 한다."""
         self.tree.refresh()
         self.reload_view()
+        self.request_poll()
         self.set_status("새로고침 완료")
 
     def reload_view(self) -> None:
@@ -690,6 +695,23 @@ class MainWindow:
         else:
             menu.add_command(label="최상위 그룹 추가…", command=lambda: self.add_group(top_level=True))
             menu.add_command(label="대역 추가 (그룹 없이)…", command=lambda: self.add_subnet(top_level=True))
+        menu.add_separator()
+        menu.add_command(label="새로고침   F5", command=self.refresh_all)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def on_dashboard_context(self, event: tk.Event, subnet: dict[str, Any] | None) -> None:
+        """그룹 화면의 대역 표 우클릭 메뉴(트리의 대역 메뉴와 같은 작업)."""
+        menu = tk.Menu(self.root, tearoff=False)
+        self.theme.style_menu(menu)
+        state = "normal" if subnet else "disabled"
+        sid = subnet["id"] if subnet else None
+        name = f"대역 {subnet['cidr']}" + (f"  {subnet['description']}" if subnet and subnet["description"] else "") \
+            if subnet else ""
+        menu.add_command(label="IP 목록 열기", state=state, command=lambda: self.open_subnet(sid))
+        menu.add_separator()
+        menu.add_command(label="대역 수정…", state=state, command=lambda: self.edit_node(("subnet", sid)))
+        menu.add_command(label="대역 삭제…", state=state,
+                         command=lambda: self.delete_node([("subnet", sid)], [name], keep_view=True))
         menu.add_separator()
         menu.add_command(label="새로고침   F5", command=self.refresh_all)
         menu.tk_popup(event.x_root, event.y_root)
@@ -870,9 +892,9 @@ class MainWindow:
 
         self.worker.submit(_group_choices, on_success=got_groups, on_error=self.show_error)
 
-    def edit_node(self) -> None:
-        """선택 그룹/대역 수정."""
-        kind, node_id = self.tree.selected()
+    def edit_node(self, node: Node | None = None) -> None:
+        """그룹/대역 수정(node가 없으면 트리에서 선택한 항목)."""
+        kind, node_id = node or self.tree.selected()
         if kind == "group" and node_id is not None:
             def got(group: dict[str, Any] | None) -> None:
                 if group is None:
@@ -892,19 +914,24 @@ class MainWindow:
                 result = SubnetEditDialog(self.root, self.theme, subnet["cidr"], subnet["description"]).show()
                 if result:
                     self.worker.submit(subnet_model.update_subnet, node_id, result["description"], self.operator,
-                                       on_success=lambda _r: (self.set_status("대역 수정 완료"), self.request_poll()),
+                                       on_success=lambda _r: (self.set_status("대역 수정 완료"), self.reload_view(),
+                                                              self.request_poll()),
                                        on_error=self.show_error)
             self.worker.submit(subnet_model.get_subnet, node_id, on_success=got_s, on_error=self.show_error)
         else:
             messagebox.showinfo("수정", "수정할 그룹 또는 대역을 좌측 트리에서 하나만 선택하세요.", parent=self.root)
 
-    def delete_node(self) -> None:
-        """선택한 그룹/대역(다중 가능) 삭제. '사용중' IP가 하나라도 있으면 전체 취소."""
-        nodes = self.tree.selected_nodes()
+    def delete_node(self, nodes: list[Node] | None = None, names: list[str] | None = None,
+                    keep_view: bool = False) -> None:
+        """그룹/대역(다중 가능) 삭제. '사용중' IP가 하나라도 있으면 전체 취소.
+
+        nodes가 없으면 트리에서 선택한 항목. keep_view=True(그룹 화면의 대역 표에서 삭제)면 삭제 후 그 화면을 유지한다.
+        """
+        nodes = nodes or self.tree.selected_nodes()
         if not nodes:
             messagebox.showinfo("삭제", "삭제할 그룹 또는 대역을 좌측 트리에서 선택하세요.", parent=self.root)
             return
-        names = [("그룹 " if k == "group" else "대역 ") + self.tree.label_of(k, n) for k, n in nodes]
+        names = names or [("그룹 " if k == "group" else "대역 ") + self.tree.label_of(k, n) for k, n in nodes]
         listing = "\n".join(f"• {n}" for n in names[:12]) + (f"\n…외 {len(names) - 12}개" if len(names) > 12 else "")
         if not messagebox.askyesno("삭제 확인", f"다음 {len(nodes)}개 항목과 그 안의 모든 하위 그룹·대역·IP를 "
                                             f"삭제하시겠습니까?\n\n{listing}\n\n"
@@ -914,9 +941,12 @@ class MainWindow:
 
         def ok(res: dict[str, int]) -> None:
             self.set_status(f"삭제 완료 — 대역 {res['subnets']:,}개 · IP {res['ips']:,}개 제거")
-            self.view_kind = self.view_id = None
-            self.view_nodes = []
-            self.empty_view.tkraise()
+            if keep_view:
+                self.reload_view()
+            else:
+                self.view_kind = self.view_id = None
+                self.view_nodes = []
+                self.empty_view.tkraise()
             self.request_poll()
 
         self.worker.submit(subnet_model.delete_nodes, nodes, self.operator, on_success=ok, on_error=self.show_error)
@@ -1032,8 +1062,27 @@ class MainWindow:
             self.set_status(f"IP {len(ips):,}개 복사됨")
 
     # ── 검색 / 테마 ──────────────────────────────────────
+    def open_help(self) -> None:
+        """툴바 [도움말]: 단축키·마우스 사용법."""
+        HelpDialog(self.root, self.theme)
+
+    def open_ip_search(self, _event: tk.Event | None = None) -> str:
+        """F3 / Ctrl+F: IP 주소 전체를 입력 → 그 IP가 있는 대역으로 이동해 선택."""
+        picked = IPSearchDialog(self.root, self.theme).show()
+        if not picked:
+            return "break"
+
+        def ok(loc: dict[str, Any] | None) -> None:
+            if loc is None:
+                messagebox.showinfo("IP 검색", f"{picked['ip']}은(는) 등록된 대역에 없는 IP입니다.", parent=self.root)
+                return
+            self.navigate_to_ip(picked["ip_id"])
+
+        self.worker.submit(ip_model.locate_ip, picked["ip_id"], on_success=ok, on_error=self.show_error)
+        return "break"
+
     def open_search(self, _event: tk.Event | None = None) -> str:
-        """F3 / Ctrl+F 전체 이력(최신순) + 통합 검색."""
+        """툴바 [전체 이력]: 전체 이력(최신순) + 통합 검색."""
         SearchDialog(self.root, self.theme, self.worker, on_navigate=self.navigate_to_ip,
                      on_error=self.show_error)
         return "break"

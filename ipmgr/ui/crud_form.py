@@ -63,7 +63,7 @@ class IPEditDialog(FormDialog):
         self.first_focus = entries["hostname" if used else "note"]
         tip = "비고: Enter 줄바꿈 · Ctrl+Enter 저장"
         if not used:
-            tip = "미사용 IP는 비고만 수정할 수 있습니다. 할당하려면 [IP 등록]을 사용하세요.\n" + tip
+            tip = "미사용 IP는 비고만 수정할 수 있습니다. 할당하려면 IP 목록에서 비고 외의 칸을 더블클릭하세요.\n" + tip
         ttk.Label(body, text=tip, style="SurfaceMuted.TLabel", font=self.theme.font_small, justify="left").grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(px(4), 0))
 

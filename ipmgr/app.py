@@ -1,7 +1,7 @@
 """IP관리 단일 진입점: 반응형 윈도우 초기화, 단축키 바인딩, 결과 펌프, 변경 감지 폴링 루프.
 
 실행:
-    python -m ipmgr.app                       # 기본: <실행 폴더>/data_삭제금지/IP관리.db
+    python -m ipmgr.app                       # 기본: <실행 폴더>/data_삭제금지/IPAM.db
     python -m ipmgr.app --data-dir data_stress  # 부하 테스트 DB로 실행
 """
 from __future__ import annotations
@@ -147,12 +147,13 @@ class App:
                 return "break"
             return wrapped
 
-        self.root.bind_all("<F3>", main_only(w.open_search))
+        self.root.bind_all("<F1>", main_only(w.open_help))
+        self.root.bind_all("<F3>", main_only(w.open_ip_search))
         self.root.bind_all("<F5>", main_only(w.refresh_all))
         self.root.bind_all("<Escape>", main_only(w.escape))
-        # Ctrl+F(전체 이력) / Ctrl+E(Excel): 한글 입력 상태에서는 글자가 'ㄹ'·'ㄷ'로 들어와 <Control-f>가
+        # Ctrl+F(IP 검색) / Ctrl+E(Excel): 한글 입력 상태에서는 글자가 'ㄹ'·'ㄷ'로 들어와 <Control-f>가
         # 동작하지 않으므로 자판 배치와 무관한 키 코드(Windows 가상 키)로 판단한다.
-        by_key = {70: main_only(w.open_search), 69: main_only(w.export_excel)}
+        by_key = {70: main_only(w.open_ip_search), 69: main_only(w.export_excel)}
 
         def ctrl_key(event: tk.Event) -> str | None:
             handler = by_key.get(event.keycode)

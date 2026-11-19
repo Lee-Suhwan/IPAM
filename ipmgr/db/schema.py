@@ -144,7 +144,7 @@ class SchemaTooNewError(Exception):
     def __init__(self, db_version: int) -> None:
         super().__init__(f"이 DB는 더 새로운 버전의 IP관리 프로그램으로 업데이트되었습니다 "
                          f"(DB 구조 v{db_version}, 이 프로그램 v{SCHEMA_VERSION}).\n\n"
-                         "공유 폴더의 최신 IP관리.exe로 다시 실행해 주세요.\n"
+                         "공유 폴더의 최신 IPAM.exe로 다시 실행해 주세요.\n"
                          "(구버전으로 계속 사용하면 새 구조를 '변조'로 잘못 판단할 수 있어 차단합니다)")
         self.db_version = db_version
 

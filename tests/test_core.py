@@ -799,11 +799,65 @@ class TestIntegrity(BaseDB):
         bdir = Path(self.tmp.name) / "Backup"
         backup_mgr.refresh_good_backup(self.db_path, bdir, 1, OP, today=date(2026, 11, 1))
         backup_mgr.refresh_good_backup(self.db_path, bdir, 2, OP, today=date(2026, 11, 2))
-        self.assertEqual(sorted(p.name for p in bdir.glob("*.db")), ["IP관리_정상백업.db", "IP관리_정상백업_이전.db"])
+        self.assertEqual(sorted(p.name for p in bdir.glob("*.db")), ["IPAM_정상백업.db", "IPAM_정상백업_이전.db"])
         self.assertEqual(backup_mgr.backup_info(bdir)["history_id"], 2)
         legacy = bdir / "IP관리_20241231.db"
         legacy.write_bytes(b"x")
         self.assertEqual(backup_mgr.purge_old_backups(bdir, 365, date(2026, 11, 2)), [legacy])
+
+
+class TestRenameDataFiles(unittest.TestCase):
+    """v1.2의 'IP관리.*' 데이터 파일 → 'IPAM.*' 자동 이름 변경."""
+
+    def test_old_files_are_renamed_and_old_exe_is_blocked(self) -> None:
+        from ipmgr.utils import path_helper
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "Backup").mkdir()
+            for name in ("IP관리.db", "IP관리.db-journal", "IP관리.anchor", "Backup/IP관리.anchor",
+                         "Backup/IP관리_정상백업.db", "Backup/IP관리_정상백업_이전.db"):
+                (data / name).write_bytes(name.encode())
+            self.assertTrue(path_helper.migrate_old_names(data))
+            self.assertEqual((data / "IPAM.db").read_bytes(), "IP관리.db".encode())
+            for name in ("IPAM.db-journal", "IPAM.anchor", "Backup/IPAM.anchor", "Backup/IPAM_정상백업.db",
+                         "Backup/IPAM_정상백업_이전.db"):
+                self.assertTrue((data / name).is_file(), name)
+            self.assertTrue((data / "IP관리.db").is_dir())            # 이전 버전이 빈 DB를 만들지 못하게
+            self.assertFalse(path_helper.migrate_old_names(data))     # 두 번째부터는 아무것도 안 함
+            with self.assertRaises(sqlite3.OperationalError):
+                sqlite3.connect(str(data / "IP관리.db")).execute("SELECT 1")
+
+    def test_rename_refused_while_old_version_has_db_open(self) -> None:
+        from ipmgr.utils import path_helper
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            old = sqlite3.connect(str(data / "IP관리.db"))
+            old.execute("CREATE TABLE t(x)")
+            old.commit()
+            try:
+                with self.assertRaises(path_helper.OldVersionRunning):
+                    path_helper.migrate_old_names(data)
+            finally:
+                old.close()
+            self.assertFalse((data / "IPAM.db").exists())
+
+
+class TestTreeFind(BaseDB):
+    """좌측 트리 검색: 그룹 이름, 대역 범위·설명."""
+
+    def test_find_by_prefix_ip_and_name(self) -> None:
+        seoul = group_model.create_group(self.conn, "서울 IDC", None, "", OP)
+        dmz = group_model.create_group(self.conn, "DMZ", seoul, "", OP)
+        s1 = subnet_model.create_subnet(self.conn, dmz, "192.168.10.0/24", "웹", True, OP)["id"]
+        s2 = subnet_model.create_subnet(self.conn, None, "192.168.11.0/24", "DMZ 백업", True, OP)["id"]
+        rows = group_model.find_nodes(self.conn, "192.168.10.")["rows"]
+        self.assertEqual([(r["kind"], r["id"], r["chain"]) for r in rows], [("subnet", s1, [seoul, dmz])])
+        self.assertEqual([r["id"] for r in group_model.find_nodes(self.conn, "192.168.10.77")["rows"]], [s1])
+        self.assertEqual(len(group_model.find_nodes(self.conn, "192.168")["rows"]), 2)
+        rows = group_model.find_nodes(self.conn, "dmz")["rows"]
+        self.assertEqual([(r["kind"], r["id"]) for r in rows], [("group", dmz), ("subnet", s2)])
+        self.assertEqual(rows[0]["chain"], [seoul])
+        self.assertEqual(group_model.find_nodes(self.conn, "없는이름")["rows"], [])
 
 
 class TestImport(BaseDB):

@@ -38,8 +38,9 @@ MAX_NOTE_LEN: Final = 4000               # 비고(여러 줄 메모) 최대 길�
 
 # ── 경로/백업 ──────────────────────────────────────────────
 DATA_DIR_NAME: Final = "data_삭제금지"
-DB_FILE_NAME: Final = "IP관리.db"
+DB_FILE_NAME: Final = "IPAM.db"
 LEGACY_DB_FILE_NAME: Final = "ipam.db"     # v1.0 파일명 → 최초 실행 시 자동 이름 변경
+OLD_FILE_PREFIX: Final = "IP관리"           # v1.1~v1.2 데이터 파일 이름(IP관리.db 등) → 처음 실행 시 IPAM.* 으로 변경
 BACKUP_DIR_NAME: Final = "Backup"
 BACKUP_PREFIX: Final = "IP관리_"
 BACKUP_RETENTION_DAYS: Final = 365
@@ -67,9 +68,9 @@ ACT_INTEGRITY_REPAIR: Final = "무결성 복구"
 ACT_IMPORT: Final = "불러오기"            # 대역 단위 요약 이력(개별 IP는 할당/재할당/회수/정보 수정으로 기록)
 
 # ── 무결성/백업 파일 ───────────────────────────────────────
-ANCHOR_FILE_NAME: Final = "IP관리.anchor"          # 검증된 이력 체인 끝 지점(DB 밖 기준값)
-GOOD_BACKUP_NAME: Final = "IP관리_정상백업.db"       # 무결성 검사를 통과한 최신 사본
-PREV_BACKUP_NAME: Final = "IP관리_정상백업_이전.db"  # 그 직전 정상 사본
+ANCHOR_FILE_NAME: Final = "IPAM.anchor"          # 검증된 이력 체인 끝 지점(DB 밖 기준값)
+GOOD_BACKUP_NAME: Final = "IPAM_정상백업.db"       # 무결성 검사를 통과한 최신 사본
+PREV_BACKUP_NAME: Final = "IPAM_정상백업_이전.db"  # 그 직전 정상 사본
 BACKUP_INFO_NAME: Final = "백업정보.json"
 TAMPERED_PREFIX: Final = "변조본_"
 

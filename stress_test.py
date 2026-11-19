@@ -4,7 +4,7 @@
 UI가 실제로 호출하는 모델 함수들의 응답 시간과 다중 프로세스 동시 수정 충돌 처리를 측정한다.
 
 사용 예:
-    python stress_test.py seed                      # data_stress/IP관리.db 생성 (전체 /8)
+    python stress_test.py seed                      # data_stress/IPAM.db 생성 (전체 /8)
     python stress_test.py seed --groups 16          # 빠른 확인용: 10.0~10.15 만 생성
     python stress_test.py bench                     # 조회/수정/검색/Excel 응답 시간 측정
     python stress_test.py concurrency --procs 8 --seconds 30

@@ -63,17 +63,35 @@ class NetworkTree(ttk.Frame):
         self._last_selection: tuple[str, ...] = ()
         px = theme.px
 
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
         head = ttk.Frame(self, style="Surface.TFrame", padding=(px(12), px(10), px(8), px(6)))
         head.grid(row=0, column=0, sticky="ew")
         head.grid_columnconfigure(0, weight=1)
-        ttk.Label(head, text="네트워크 계층", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(head, text="다중 선택 · 드래그로 이동/순서", style="SurfaceMuted.TLabel",
-                  font=theme.font_small).grid(row=0, column=1, sticky="e")
+        # 그룹·대역 찾기: 치는 대로 결과 목록 → 고르면 트리를 펼쳐 이동
+        self.find_var = tk.StringVar(self)
+        self.find_entry = ttk.Entry(head, textvariable=self.find_var, font=theme.font)
+        self.find_entry.grid(row=0, column=0, sticky="ew")
+        self._find_hint = True
+        self._find_job: str | None = None
+        self._find_seq = 0
+        self._found: list[dict[str, Any]] = []
+        self._show_find_hint()
+        self.find_entry.bind("<FocusIn>", self._find_focus_in)
+        self.find_entry.bind("<FocusOut>", lambda e: self._show_find_hint())
+        self.find_entry.bind("<KeyRelease>", self._find_key)
+        self.find_entry.bind("<Return>", lambda e: (self._find_go(0), "break")[1])
+        self.find_entry.bind("<Down>", lambda e: (self._find_focus_list(), "break")[1])
+        self.find_entry.bind("<Escape>", lambda e: (self._find_clear(), "break")[1])
+        self.find_list = tk.Listbox(self, height=8, activestyle="none", exportselection=False,
+                                    font=theme.font, borderwidth=0, highlightthickness=1)
+        self.find_list.bind("<Return>", lambda e: (self._find_go(self._list_index()), "break")[1])
+        self.find_list.bind("<ButtonRelease-1>", lambda e: self._find_go(self._list_index()))
+        self.find_list.bind("<Escape>", lambda e: (self._find_clear(), "break")[1])
+        self.find_list.bind("<Up>", self._find_list_up)
 
         body = ttk.Frame(self, style="Surface.TFrame")
-        body.grid(row=1, column=0, sticky="nsew")
+        body.grid(row=2, column=0, sticky="nsew")
         body.grid_rowconfigure(0, weight=1)
         body.grid_columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(body, columns=("usage",), show="tree headings", selectmode="extended")
@@ -111,6 +129,117 @@ class NetworkTree(ttk.Frame):
         t.tag_configure("drop_bad", background=p["drop_bad"])
         if self._line is not None:
             self._line.configure(background=p["accent"])
+        self.find_list.configure(background=p["surface"], foreground=p["text"], selectbackground=p["accent"],
+                                 selectforeground="#FFFFFF", highlightbackground=p["border"],
+                                 highlightcolor=p["border"], disabledforeground=p["text_muted"])
+        self._show_find_hint()
+
+    # ── 그룹·대역 찾기 ─────────────────────────────────────
+    FIND_HINT = "🔍 그룹·대역 찾기 (예: 192.168.10. · DMZ)"
+
+    def _show_find_hint(self) -> None:
+        """비어 있고 포커스가 없으면 안내 문구를 흐리게 보여 준다."""
+        if self.find_var.get() and not self._find_hint:
+            return
+        if self.focus_get() is self.find_entry:
+            return
+        self._find_hint = True
+        self.find_var.set(self.FIND_HINT)
+        self.find_entry.configure(foreground=self.theme.palette["text_muted"])
+
+    def _find_focus_in(self, _event: tk.Event) -> None:
+        if self._find_hint:
+            self._find_hint = False
+            self.find_var.set("")
+            self.find_entry.configure(foreground=self.theme.palette["text"])
+
+    def _find_text(self) -> str:
+        return "" if self._find_hint else self.find_var.get().strip()
+
+    def _find_key(self, event: tk.Event) -> None:
+        if event.keysym in ("Return", "Down", "Up", "Escape", "Tab"):
+            return
+        if self._find_job:
+            self.after_cancel(self._find_job)
+        self._find_job = self.after(200, self._find_run)
+
+    def _find_run(self, then: Callable[[], None] | None = None) -> None:
+        self._find_job = None
+        text = self._find_text()
+        if not text:
+            self._find_hide()
+            return
+        self._find_seq += 1
+        seq = self._find_seq
+
+        def ok(result: dict[str, Any]) -> None:
+            if seq != self._find_seq or self._find_text() != text:
+                return
+            self._find_show(result)
+            if then:
+                then()
+        self.worker.submit(group_model.find_nodes, text, on_success=ok, on_error=self.on_error, silent=True)
+
+    def _find_show(self, result: dict[str, Any]) -> None:
+        lb = self.find_list
+        self._found = result["rows"]
+        lb.delete(0, "end")
+        for r in self._found:
+            if r["kind"] == "group":
+                lb.insert("end", f"📁  {r['path'] or r['label']}")
+            else:
+                desc = f"  · {r['description']}" if r.get("description") else ""
+                where = f"   ({r['path']})" if r["path"] else ""
+                lb.insert("end", f"🌐  {r['label']}{desc}{where}")
+        if not self._found:
+            lb.insert("end", "찾는 그룹·대역이 없습니다")
+            lb.itemconfigure(0, foreground=self.theme.palette["text_muted"])
+        elif result["truncated"]:
+            lb.insert("end", f"… 처음 {len(self._found)}건만 표시 — 더 구체적으로 입력하세요")
+            lb.itemconfigure("end", foreground=self.theme.palette["text_muted"])
+        lb.configure(height=min(8, max(1, lb.size())))
+        lb.grid(row=1, column=0, sticky="ew", padx=self.theme.px(8), pady=(0, self.theme.px(6)))
+
+    def _find_hide(self) -> None:
+        self._found = []
+        self.find_list.grid_remove()
+
+    def _find_clear(self) -> None:
+        self.find_var.set("")
+        self._find_hide()
+        self.tree.focus_set()
+        self._show_find_hint()
+
+    def _find_focus_list(self) -> None:
+        if self._found:
+            self.find_list.focus_set()
+            self.find_list.selection_clear(0, "end")
+            self.find_list.selection_set(0)
+            self.find_list.activate(0)
+
+    def _find_list_up(self, _event: tk.Event) -> str | None:
+        if self._list_index() == 0:
+            self.find_entry.focus_set()
+            return "break"
+        return None
+
+    def _list_index(self) -> int:
+        sel = self.find_list.curselection()
+        return sel[0] if sel else 0
+
+    def _find_go(self, index: int) -> None:
+        """결과로 이동(결과가 아직 없으면 먼저 찾은 뒤 첫 번째로)."""
+        if not self._found:
+            if self._find_text():
+                if self._find_job:
+                    self.after_cancel(self._find_job)
+                self._find_run(then=lambda: self._find_go(0) if self._found else None)
+            return
+        if index >= len(self._found):
+            return
+        r = self._found[index]
+        self._find_hide()
+        self.reveal(r["chain"], node_iid(r["kind"], r["id"]), on_done=self.tree.focus_set)
 
     # ── 공개 API ──────────────────────────────────────────
     def refresh(self, on_done: Callable[[], None] | None = None) -> None:
