@@ -11,9 +11,6 @@ from ipmgr.ui.theme_mgr import ThemeManager
 from ipmgr.ui.widgets import FormDialog, scrolled_tree
 
 MODE_FILE, MODE_TEXT = "file", "text"
-TEXT_EXAMPLE = ("IP\t호스트네임\t담당자\t요청번호\t비고\n"
-                "10.10.1.10\tweb01\t김민수\tREQ-2026-0412\t서비스 웹 서버\n"
-                "10.10.1.11\tweb02\t김민수\tREQ-2026-0412\t")
 MAX_PREVIEW = 3000
 
 
@@ -55,8 +52,6 @@ class ImportDialog(FormDialog):
         self.text = self.note_box("", height=12)
         self.text.text.configure(wrap="none", width=70)
         self.text.grid(in_=self.text_row, row=1, column=0, sticky="nsew")
-        ttk.Button(self.text_row, text="예시 넣기", width=0,
-                   command=lambda: self.text.set(TEXT_EXAMPLE)).grid(row=2, column=0, sticky="w", pady=(px(4), 0))
         self.first_focus = path
         self._switch()
 
