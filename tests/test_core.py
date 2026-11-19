@@ -806,42 +806,6 @@ class TestIntegrity(BaseDB):
         self.assertEqual(backup_mgr.purge_old_backups(bdir, 365, date(2026, 11, 2)), [legacy])
 
 
-class TestRenameDataFiles(unittest.TestCase):
-    """v1.2의 'IP관리.*' 데이터 파일 → 'IPAM.*' 자동 이름 변경."""
-
-    def test_old_files_are_renamed_and_old_exe_is_blocked(self) -> None:
-        from ipmgr.utils import path_helper
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            (data / "Backup").mkdir()
-            for name in ("IP관리.db", "IP관리.db-journal", "IP관리.anchor", "Backup/IP관리.anchor",
-                         "Backup/IP관리_정상백업.db", "Backup/IP관리_정상백업_이전.db"):
-                (data / name).write_bytes(name.encode())
-            self.assertTrue(path_helper.migrate_old_names(data))
-            self.assertEqual((data / "IPAM.db").read_bytes(), "IP관리.db".encode())
-            for name in ("IPAM.db-journal", "IPAM.anchor", "Backup/IPAM.anchor", "Backup/IPAM_정상백업.db",
-                         "Backup/IPAM_정상백업_이전.db"):
-                self.assertTrue((data / name).is_file(), name)
-            self.assertTrue((data / "IP관리.db").is_dir())            # 이전 버전이 빈 DB를 만들지 못하게
-            self.assertFalse(path_helper.migrate_old_names(data))     # 두 번째부터는 아무것도 안 함
-            with self.assertRaises(sqlite3.OperationalError):
-                sqlite3.connect(str(data / "IP관리.db")).execute("SELECT 1")
-
-    def test_rename_refused_while_old_version_has_db_open(self) -> None:
-        from ipmgr.utils import path_helper
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            old = sqlite3.connect(str(data / "IP관리.db"))
-            old.execute("CREATE TABLE t(x)")
-            old.commit()
-            try:
-                with self.assertRaises(path_helper.OldVersionRunning):
-                    path_helper.migrate_old_names(data)
-            finally:
-                old.close()
-            self.assertFalse((data / "IPAM.db").exists())
-
-
 class TestTreeFind(BaseDB):
     """좌측 트리 검색: 그룹 이름, 대역 범위·설명."""
 

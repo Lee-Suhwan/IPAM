@@ -40,7 +40,6 @@ MAX_NOTE_LEN: Final = 4000               # 비고(여러 줄 메모) 최대 길�
 DATA_DIR_NAME: Final = "data_삭제금지"
 DB_FILE_NAME: Final = "IPAM.db"
 LEGACY_DB_FILE_NAME: Final = "ipam.db"     # v1.0 파일명 → 최초 실행 시 자동 이름 변경
-OLD_FILE_PREFIX: Final = "IP관리"           # v1.1~v1.2 데이터 파일 이름(IP관리.db 등) → 처음 실행 시 IPAM.* 으로 변경
 BACKUP_DIR_NAME: Final = "Backup"
 BACKUP_PREFIX: Final = "IP관리_"
 BACKUP_RETENTION_DAYS: Final = 365
