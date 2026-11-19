@@ -563,7 +563,7 @@ class TestIntegrity(BaseDB):
                             "김철수", "REQ-1", "", OP)
 
     def check(self) -> integrity_model.Report:
-        return integrity_model.full_check(None, self.anchor, conn=self.conn)
+        return integrity_model.full_check(None, self.anchor, conn=self.conn, rows=True)
 
     def quick(self) -> integrity_model.Report:
         return integrity_model.quick_check(self.conn, self.anchor)
@@ -625,6 +625,63 @@ class TestIntegrity(BaseDB):
         # 최근 이력을 통째로 지우면 기준값(anchor)이 잡아낸다
         self.raw("DELETE FROM history_logs WHERE id = ?", head)
         self.assertIn("anchor", integrity_model.quick_check(self.conn, self.anchor).counts)
+
+    def test_deleting_anchor_and_recent_history_is_detected(self) -> None:
+        """기준값 파일을 지우고 최근 이력까지 지워도 잡아낸다."""
+        self.check()
+        late = ip_to_int("10.1.1.40")
+        ip_model.assign_ips(self.conn, {late: 1}, {late: "late"}, "박", "REQ-9", "", OP)
+        self.assertTrue(self.quick().ok)                      # 기준값(본 파일 + Backup 사본) 갱신
+        self.assertEqual(integrity_ig.anchor_mirrors(self.anchor), [self.anchor.parent / "Backup" / self.anchor.name])
+        head = self.conn.execute("SELECT MAX(id) FROM history_logs").fetchone()[0]
+        mirror = self.anchor.parent / "Backup" / self.anchor.name
+        self.anchor.unlink()
+        mirror.unlink()                                        # 보조 사본까지 지움
+        self.raw("DELETE FROM history_logs WHERE id = ?", head)
+        report = self.quick()                                  # 감시 기록(dirty)으로 잡힘
+        self.assertEqual(report.targets.get("gap"), [head], report.summary())
+
+    def test_deleting_anchor_history_and_watch_log_is_caught_by_backup_copy(self) -> None:
+        """감시 기록까지 지워도 Backup 폴더의 보조 기준값이 남아 있으면 잡힌다."""
+        self.check()
+        head = self.conn.execute("SELECT MAX(id) FROM history_logs").fetchone()[0]
+        self.anchor.unlink()
+        self.raw("DELETE FROM history_logs WHERE id = ?", head)
+        self.raw("DELETE FROM dirty")
+        for report in (self.quick(), self.check()):
+            self.assertIn("anchor", report.counts, report.summary())
+
+    def test_deleting_recent_history_is_caught_by_watch_without_anchor(self) -> None:
+        """기준값이 하나도 없어도, 밖에서 지운 최근 이력은 감시 기록으로 잡힌다."""
+        integrity_model.full_check(None, None, conn=self.conn)
+        head = self.conn.execute("SELECT MAX(id) FROM history_logs").fetchone()[0]
+        self.raw("DELETE FROM history_logs WHERE id = ?", head)
+        report = integrity_model.quick_check(self.conn, None)
+        self.assertEqual(report.targets.get("gap"), [head])
+
+    def test_watched_db_baseline_checks_chain_and_watch_log_only(self) -> None:
+        """감시 중인 DB는 기준 검사 때 행 전체를 다시 읽지 않고, 밖에서 고친 행(dirty)만 확인한다."""
+        self.check()
+        self.anchor.unlink()
+        (self.anchor.parent / "Backup" / self.anchor.name).unlink()
+        self.raw("UPDATE ips SET hostname = 'hacked' WHERE id = ?", self.ips[0])
+        report = integrity_model.full_check(None, self.anchor, conn=self.conn)       # 자동 판단
+        self.assertTrue(any("외부 수정 행만" in n for n in report.notes))
+        self.assertEqual(report.targets.get("ip"), [self.ips[0]])
+        self.assertFalse(self.anchor.exists())                                     # 이상이 있으면 기준값을 만들지 않음
+
+    def test_full_row_scan_finds_orphan_rows(self) -> None:
+        self.check()
+        self.raw("INSERT INTO ips(id, subnet_id) VALUES (?, ?)", ip_to_int("10.9.9.9"), self.sid)
+        self.assertEqual(self.check().targets.get("orphan"), [ip_to_int("10.9.9.9")])
+
+    def test_missing_anchor_alone_is_rebuilt_from_mirror(self) -> None:
+        """기준값 파일만 사라지고 데이터는 정상이면 보조 기준값으로 확인 후 다시 만든다."""
+        self.check()
+        self.anchor.unlink()
+        report = self.quick()
+        self.assertTrue(report.ok, report.summary())
+        self.assertTrue(self.anchor.exists())
 
     def test_restore_from_good_backup_and_replay(self) -> None:
         bdir = Path(self.tmp.name) / "Backup"
@@ -747,6 +804,86 @@ class TestIntegrity(BaseDB):
         legacy = bdir / "IP관리_20241231.db"
         legacy.write_bytes(b"x")
         self.assertEqual(backup_mgr.purge_old_backups(bdir, 365, date(2026, 11, 2)), [legacy])
+
+
+class TestImport(BaseDB):
+    """불러오기: 엑셀/텍스트 읽기, 중복 확인, 저장."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _, self.sid = self.make_subnet("10.10.1.0/24")
+        self.web01 = ip_to_int("10.10.1.10")
+        ip_model.assign_ips(self.conn, {self.web01: 1}, {self.web01: "old-web"}, "이영희", "REQ-0", "", OP)
+
+    def test_parse_text_default_order_and_header(self) -> None:
+        from ipmgr.logic import importer
+        rows = importer.parse_text("10.10.1.10\tweb01\t김민수\tREQ-1\t서비스 웹\n10.10.1.11 web02 김민수 REQ-1 웹 서버 2\n")
+        self.assertEqual([r.ip for r in rows], ["10.10.1.10", "10.10.1.11"])
+        self.assertEqual(rows[1].values["note"], "웹 서버 2")              # 공백 구분: 마지막 칸은 공백 포함
+        self.assertEqual(rows[0].values["status"], STATUS_USED)
+        rows = importer.parse_text("비고,IP 주소,사용여부,호스트명,할당일\n메모,10.10.1.12,미사용,,2026.3.2\n"
+                                   "x,10.10.1.300,사용,h,\n")
+        self.assertEqual((rows[0].ip, rows[0].values["status"], rows[0].values["note"],
+                          rows[0].values["allocated_date"]), ("10.10.1.12", STATUS_UNUSED, "메모", "2026-03-02"))
+        self.assertIn("IP 형식", rows[1].error)
+
+    def test_parse_excel_finds_table_below_title(self) -> None:
+        from openpyxl import Workbook
+        from ipmgr.logic import importer
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["서울 IDC 서버팜 IP 관리대장 (10.10.1.0/24)"])
+        ws.append(["※ 수정 시 변경내역 기록"])
+        ws.append([])
+        ws.append(["No", "IP 주소", "사용여부", "호스트네임", "담당자", "요청번호", "할당일", "비고"])
+        ws.append([1, "10.10.1.20", "사용", "db01", "박", "REQ-5", "2026-03-11", "DB"])
+        ws.append([2, "10.10.1.21", "사용?", "db02", "박", "", "", ""])
+        wb.create_sheet("빈시트")
+        path = Path(self.tmp.name) / "ledger.xlsx"
+        wb.save(path)
+        rows = importer.parse_excel(path)
+        self.assertEqual([(r.ip, r.values["hostname"], r.values["status"]) for r in rows],
+                         [("10.10.1.20", "db01", STATUS_USED), ("10.10.1.21", "db02", STATUS_USED)])
+        self.assertEqual(rows[0].source, "Sheet!5행")
+
+    def test_exported_excel_can_be_imported_back(self) -> None:
+        """이 프로그램이 내보낸 엑셀은 IP 시트만 읽고 이력 시트는 건너뛴다."""
+        from ipmgr.logic import importer
+        path = Path(self.tmp.name) / "export.xlsx"
+        excel_export.write_report(excel_export.collect_subnet_report(self.conn, self.sid, OP), path)
+        rows = importer.parse_excel(path)
+        self.assertEqual(len(rows), 254)
+        self.assertFalse(any(r.error for r in rows))
+        plan = ip_model.plan_import(self.conn, rows)
+        self.assertEqual((len(plan["new"]), len(plan["dup"]), len(plan["same"])), (0, 0, 254))
+
+    def test_plan_and_import_with_duplicate_choice(self) -> None:
+        from ipmgr.logic import importer
+        text = ("IP\t호스트네임\t담당자\t요청번호\t비고\n"
+                "10.10.1.10\tweb01\t김민수\tREQ-1\t\n"         # 이미 값이 있음 → 덮어쓰기 대상
+                "10.10.1.11\tweb02\t김민수\tREQ-1\t\n"         # 새로 입력
+                "10.10.1.11\tdup\t김민수\tREQ-1\t\n"           # 입력 안 중복 → 오류
+                "10.20.0.5\tx\t김\tR\t\n")                      # 등록된 대역 없음 → 오류
+        plan = ip_model.plan_import(self.conn, importer.parse_text(text))
+        self.assertEqual((len(plan["new"]), len(plan["dup"]), len(plan["errors"])), (1, 1, 2))
+        # 건너뛰기: 새 IP만 들어가고 기존 값은 그대로
+        res = ip_model.import_ips(self.conn, importer.parse_text(text), False, OP, "텍스트 붙여넣기")
+        self.assertEqual((res["applied"], res["skipped"]), (1, 1))
+        self.assertEqual(ip_model.get_ip(self.conn, self.web01)["hostname"], "old-web")
+        self.assertEqual(ip_model.get_ip(self.conn, ip_to_int("10.10.1.11"))["hostname"], "web02")
+        # 덮어쓰기: 같은 내용을 다시 불러오면 web02는 '변경 없음', web01만 덮어씀
+        res = ip_model.import_ips(self.conn, importer.parse_text(text), True, OP, "텍스트 붙여넣기")
+        self.assertEqual((res["applied"], res["same"]), (1, 1))
+        row = ip_model.get_ip(self.conn, self.web01)
+        self.assertEqual((row["hostname"], row["assignee"]), ("web01", "김민수"))
+        timeline = ip_timeline(self.conn, self.web01)
+        self.assertEqual(timeline[0]["action"], "정보 수정")
+        self.assertIn("old-web", timeline[0]["diff_summary"])            # 이전 값은 이력에 남음
+        summary = self.conn.execute("SELECT diff_summary FROM history_logs WHERE action = '불러오기' "
+                                    "ORDER BY id DESC").fetchone()[0]
+        self.assertIn("덮어쓰기 1건", summary)
+        anchor = Path(self.tmp.name) / "anchor"
+        self.assertTrue(integrity_model.full_check(None, anchor, conn=self.conn).ok)   # 해시·이력 체인 정상
 
 
 if __name__ == "__main__":

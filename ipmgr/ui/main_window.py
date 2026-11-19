@@ -29,6 +29,7 @@ from ipmgr.models.common import AppError, ConflictError
 from ipmgr.ui.bulk_form import AssignDialog, GroupDialog, ReclaimDialog, SubnetDialog, SubnetEditDialog
 from ipmgr.ui.crud_form import IPEditDialog
 from ipmgr.ui.history_view import HistoryTimeline
+from ipmgr.ui.import_form import ImportDialog, ImportPreviewDialog
 from ipmgr.utils import backup_mgr, path_helper
 from ipmgr.ui.search_view import SearchDialog
 from ipmgr.ui.subnet_dashboard import SubnetDashboard
@@ -103,6 +104,7 @@ class SubnetView(ttk.Frame):
                    command=win.assign_selected).pack(side="left")
         ttk.Button(actions, text="↩ IP 회수", width=0, command=win.reclaim_selected).pack(side="left", padx=(px(6), 0))
         ttk.Button(actions, text="✎ 대역 수정", width=0, command=win.edit_node).pack(side="left", padx=(px(6), 0))
+        ttk.Button(actions, text="📥 불러오기", width=0, command=win.import_data).pack(side="left", padx=(px(6), 0))
         ttk.Button(actions, text="📊 Excel 내보내기", width=0, command=win.export_excel).pack(side="left",
                                                                                          padx=(px(6), 0))
         self.subtitle = ttk.Label(card, text="", style="SurfaceMuted.TLabel")
@@ -368,8 +370,8 @@ class MainWindow:
         buttons = (("＋ 그룹", self.add_group), ("＋ 대역", self.add_subnet), None,
                    ("✔ IP 등록", self.assign_selected), ("↩ IP 회수", self.reclaim_selected), None,
                    ("✎ 수정", self.edit_action), ("🗑 삭제", self.delete_node), None,
-                   ("🔍 검색 (F3)", self.open_search), ("📊 Excel 내보내기", self.export_excel),
-                   ("⟳ 새로고침 (F5)", self.refresh_all))
+                   ("🕘 전체 이력 (F3)", self.open_search), ("📥 불러오기", self.import_data),
+                   ("📊 Excel 내보내기", self.export_excel), ("⟳ 새로고침 (F5)", self.refresh_all))
         for spec in buttons:
             if spec is None:
                 ttk.Frame(toolbar, style="Divider.TFrame", width=1).pack(side="left", fill="y", padx=px(8),
@@ -1031,7 +1033,7 @@ class MainWindow:
 
     # ── 검색 / 테마 ──────────────────────────────────────
     def open_search(self, _event: tk.Event | None = None) -> str:
-        """F3 / Ctrl+F 통합 검색."""
+        """F3 / Ctrl+F 전체 이력(최신순) + 통합 검색."""
         SearchDialog(self.root, self.theme, self.worker, on_navigate=self.navigate_to_ip,
                      on_error=self.show_error)
         return "break"
@@ -1067,6 +1069,61 @@ class MainWindow:
         self._apply_theme(self.theme.palette)
         label = dict(self.THEME_CHOICES)[pref].split(" ", 1)[1]
         self.set_status(f"테마: {label}" + ("  — Windows 설정을 바꾸면 자동으로 따라갑니다" if pref == "system" else ""))
+
+    # ── 불러오기 ─────────────────────────────────────────
+    def import_data(self, _event: tk.Event | None = None) -> str:
+        """엑셀 파일 / 텍스트 붙여넣기 → 미리보기 → (이미 값이 있으면 덮어쓸지 확인) → 저장."""
+        picked = ImportDialog(self.root, self.theme).show()
+        if not picked:
+            return "break"
+        rows, source = picked["rows"], picked["source"]
+
+        def planned(plan: dict[str, Any]) -> None:
+            self.set_busy(False)
+            choice = ImportPreviewDialog(self.root, self.theme, plan, source).show()
+            if not choice or not choice["apply"]:
+                return
+            overwrite = False
+            if plan["dup"]:
+                answer = messagebox.askyesnocancel(
+                    "이미 값이 있는 IP",
+                    f"이미 값이 있는 IP가 {len(plan['dup']):,}개 있습니다.\n\n"
+                    f"• 예: 불러온 내용으로 덮어쓰기\n"
+                    f"• 아니요: 이 {len(plan['dup']):,}개는 건너뛰고 새로 입력할 {len(plan['new']):,}개만 불러오기\n"
+                    f"• 취소: 불러오기 취소\n\n덮어쓴 IP의 이전 값은 이력에 그대로 남습니다.",
+                    icon="warning", parent=self.root)
+                if answer is None:
+                    return
+                overwrite = bool(answer)
+                if not overwrite and not plan["new"]:
+                    messagebox.showinfo("불러오기", "새로 입력할 IP가 없어 불러오기를 마칩니다.", parent=self.root)
+                    return
+            self.set_busy(True)
+            self.set_status("불러오는 중…")
+            self.worker.submit(ip_model.import_ips, rows, overwrite, self.operator, source,
+                               on_success=done, on_error=failed)
+
+        def done(res: dict[str, Any]) -> None:
+            self.set_busy(False)
+            parts = [f"{res['applied']:,}건 불러옴"]
+            if res["skipped"]:
+                parts.append(f"건너뜀 {res['skipped']:,}건")
+            if res["errors"]:
+                parts.append(f"오류 {res['errors']:,}건 제외")
+            self.set_status("불러오기 완료: " + " · ".join(parts))
+            messagebox.showinfo("불러오기", "불러오기를 마쳤습니다.\n\n" + "\n".join(f"• {p}" for p in parts),
+                                parent=self.root)
+            self.reload_view()
+            self.request_poll()
+
+        def failed(exc: BaseException) -> None:
+            self.set_busy(False)
+            self.show_error(exc)
+
+        self.set_busy(True)
+        self.set_status("불러온 내용 확인 중…")
+        self.worker.submit(ip_model.plan_import, rows, on_success=planned, on_error=failed)
+        return "break"
 
     # ── Excel ────────────────────────────────────────────
     def export_excel(self, _event: tk.Event | None = None) -> str:

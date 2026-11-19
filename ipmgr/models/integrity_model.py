@@ -7,6 +7,7 @@
   · 프로그램 밖에서 바뀐 행(dirty — 트리거가 위치를 기록)만 골라 해시로 검증
 - 전체 검사(full_check): 이력 체인 전체 + 모든 행 해시. 화면에는 노출하지 않고
   ① 이전 버전 DB를 처음 열 때 1회(기준 검사) ② 정상 백업 검증 에만 쓴다.
+  기준값 파일만 없어진 감시 중인 DB는 이력 체인 + 외부 수정 행(dirty)만 검사한다.
 
 복구(recover — 사용자 확인 1번, 방식은 자동 선택)
 - 행만 변조된 경우(이력 체인은 정상): 이력의 마지막 스냅샷으로 현재 상태를 재구성 → 손실 없음
@@ -77,6 +78,7 @@ class Report:
     head: tuple[int, bytes] = (0, ig.GENESIS)
     notes: list[str] = field(default_factory=list)
     needs_full: bool = False
+    restore_anchor: bool = False                  # 기준값 파일이 없어 보조 기준값으로 검사함 → 통과 시 다시 만든다
     elapsed: float = 0.0
     finished_at: str = ""
 
@@ -150,19 +152,30 @@ def check_anchor(conn: sqlite3.Connection, report: Report, anchor_path: Path | N
     except ig.AnchorInvalid as exc:
         report.add("anchor", None, "기준값 파일", str(exc))
         return None
+    source = "기준값 파일"
     if anchor is None:
-        report.notes.append("기준값 파일이 없어 전체 검사 후 새로 만듭니다.")
-        report.needs_full = True
-        return None
+        # 기준값 파일이 없으면 보조 사본·정상 백업 DB의 마지막 지점으로 대신 검사한다
+        # (기준값 파일과 최근 이력을 함께 지운 경우를 잡기 위해)
+        candidates = [(a, "보조 기준값") for a in ig.read_mirror_anchors(anchor_path)]
+        candidates += [(a, "정상 백업") for a in ig.backup_heads(anchor_path)]
+        if not candidates:
+            report.notes.append("기준값 파일이 없어 전체 검사 후 새로 만듭니다.")
+            report.needs_full = True
+            return None
+        anchor, source = max(candidates, key=lambda c: c[0].id)
+        report.restore_anchor = True
+        report.notes.append(f"기준값 파일이 없어 {source}(이력 #{anchor.id})으로 검사했습니다.")
     row = conn.execute("SELECT chain_hash FROM history_logs WHERE id = ?", (anchor.id,)).fetchone()
     if row is None:
         head_id = chain_head(conn)[0]
+        lost = "" if source == "기준값 파일" else " · 기준값 파일도 삭제됨"
         report.add("anchor", anchor.id, f"이력 #{anchor.id}",
-                   f"검증된 기준 시점(#{anchor.id})의 이력이 없습니다 — 최근 이력이 삭제되었거나 DB가 과거 "
-                   f"사본으로 교체되었습니다 (현재 마지막 이력 #{head_id})")
+                   f"검증된 기준 시점(#{anchor.id}, {source})의 이력이 없습니다 — 최근 이력이 삭제되었거나 DB가 과거 "
+                   f"사본으로 교체되었습니다 (현재 마지막 이력 #{head_id}){lost}")
         return None
     if row[0] is None or not hmac.compare_digest(bytes(row[0]), anchor.hash):
-        report.add("anchor", anchor.id, f"이력 #{anchor.id}", "기준 시점 이력의 해시가 다릅니다 — 이력이 재작성되었습니다")
+        report.add("anchor", anchor.id, f"이력 #{anchor.id}",
+                   f"기준 시점 이력의 해시가 다릅니다({source}) — 이력이 재작성되었습니다")
         return None
     return anchor
 
@@ -190,8 +203,9 @@ def quick_check(conn: sqlite3.Connection, anchor_path: Path | None) -> Report:
     started = time.perf_counter()
     report, anchor, keys = _quick_report(conn, anchor_path)
     if report.ok:
-        if anchor is not None and report.head[0] > anchor.id:
-            _write_anchor_safe(anchor_path, report)
+        if anchor is not None and (report.head[0] > anchor.id or report.restore_anchor or
+                                   not all(p.exists() for p in ig.anchor_mirrors(anchor_path))):
+            _write_anchor_safe(anchor_path, report)        # 보조 사본이 없으면(이전 버전에서 업데이트 등) 만든다
         if keys:
             _clear_dirty(conn, keys)
     report.elapsed = time.perf_counter() - started
@@ -266,8 +280,11 @@ _REVERTED_SQL = f"""
      LIMIT 1"""
 
 
-def verify_dirty(conn: sqlite3.Connection, report: Report) -> list[tuple[int, int]]:
-    """프로그램 밖에서 바뀐 행만 해시로 검증하고, 검증한 (kind, ref) 목록을 반환한다."""
+def verify_dirty(conn: sqlite3.Connection, report: Report, tail_only_history: bool = False) -> list[tuple[int, int]]:
+    """프로그램 밖에서 바뀐 행만 해시로 검증하고, 검증한 (kind, ref) 목록을 반환한다.
+
+    tail_only_history: 이력 체인을 처음부터 따로 검증한 경우 — 체인이 볼 수 없는 '마지막 이력 뒤 삭제'만 본다.
+    """
     if not has_watch(conn):
         return []
     keys: list[tuple[int, int]] = []
@@ -324,11 +341,14 @@ def verify_dirty(conn: sqlite3.Connection, report: Report) -> list[tuple[int, in
     for ids in _dirty_refs(conn, DIRTY_HISTORY):
         keys += [(DIRTY_HISTORY, i) for i in ids]
         for hid in ids:
+            if tail_only_history and hid <= head:
+                continue
             row = conn.execute(f"SELECT id, {_HIST_COLS}, chain_hash FROM history_logs WHERE id = ?",
                                (hid,)).fetchone()
             if row is None:
-                if hid <= head:
-                    report.add("gap", hid, f"이력 #{hid}", "이력이 삭제되었습니다")
+                # 프로그램은 이력을 지우지 않는다 → 밖에서 지운 이력(마지막 이력보다 뒤 = 최근 이력 삭제 포함)
+                report.add("gap", hid, f"이력 #{hid}",
+                           "이력이 삭제되었습니다" if hid <= head else "최근 이력이 삭제되었습니다")
                 continue
             if hid == 1:
                 prev = ig.GENESIS
@@ -372,33 +392,56 @@ def _scan(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> Any:
 
 
 def verify_rows(conn: sqlite3.Connection, report: Report, progress: Progress | None = None) -> None:
-    """IP/대역/그룹 행 해시, 손대지 않은 IP, 통계 카운터, 누락/비정상 IP 행 검사."""
-    n = 0
-    total_rows =conn.execute("SELECT COUNT(*) FROM ips WHERE row_hash IS NOT NULL").fetchone()[0] or 1
-    for row in _scan(conn, f"SELECT {_IP_COLS}, row_hash FROM ips WHERE row_hash IS NOT NULL AND id > ? "
-                           f"ORDER BY id LIMIT ?"):
-        data = dict(zip(ig.IP_FIELDS, row))
-        expected = ig.ip_row_hash(data)
-        if expected is None or not hmac.compare_digest(expected, bytes(row[-1])):
-            report.add("ip", row[0], int_to_ip(row[0]), "IP 정보가 프로그램 밖에서 수정되었습니다")
-        n += 1
-        if progress and n % CHUNK == 0:
+    """IP/대역/그룹 행 해시, 손대지 않은 IP, 통계 카운터, 누락/비정상 IP 행 검사.
+
+    IP 표는 id 순으로 CHUNK씩 한 번만 훑으면서 해시·초기 상태·소속 대역·대역별 개수를 함께 확인한다
+    (예전처럼 조건마다 표 전체를 다시 읽거나, 한 번에 오래 읽어 다른 사용자의 저장을 막지 않도록).
+    """
+    subnets = conn.execute("SELECT network_int, broadcast_int, id, prefix, cidr, total_count, used_count "
+                           "FROM subnets ORDER BY network_int").fetchall()
+    actual = [0] * len(subnets)
+    used = [0] * len(subnets)
+    total_rows = sum(s[5] for s in subnets) or 1
+    p = 0
+    n = hashed = 0
+    idx_status, idx_version = ig.IP_FIELDS.index("status"), ig.IP_FIELDS.index("version")
+    blank_idx = [ig.IP_FIELDS.index(k) for k in ("hostname", "allocated_date", "assignee", "request_no", "note",
+                                                  "updated_at", "updated_by")]
+    nf = len(ig.IP_FIELDS)
+    last = -1
+    while True:
+        rows = conn.execute(f"SELECT {_IP_COLS}, row_hash FROM ips WHERE id > ? ORDER BY id LIMIT ?",
+                            (last, CHUNK)).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            ip_id, stored = row[0], row[nf]
+            values = tuple(row[:nf])
+            pristine = (values[idx_status] == STATUS_UNUSED and values[idx_version] == 1
+                        and not any(values[i] for i in blank_idx))
+            if stored is not None:
+                hashed += 1
+                if pristine or not hmac.compare_digest(ig.ip_values_hash(values), bytes(stored)):
+                    report.add("ip", ip_id, int_to_ip(ip_id), "IP 정보가 프로그램 밖에서 수정되었습니다")
+            elif not pristine:
+                report.add("ip", ip_id, int_to_ip(ip_id), "해시 없이 값이 바뀌었습니다(직접 수정)")
+            # 소속 대역(대역은 겹치지 않으므로 id 순으로 포인터만 앞으로 옮긴다)
+            while p < len(subnets) and subnets[p][1] < ip_id:
+                p += 1
+            if p < len(subnets) and subnets[p][0] <= ip_id and subnets[p][2] == values[1]:
+                actual[p] += 1
+                used[p] += values[idx_status] == STATUS_USED
+            else:
+                if p < len(subnets) and subnets[p][0] <= ip_id:
+                    actual[p] += 1                       # 범위 안이지만 소속이 다른 행도 개수에는 포함
+                    used[p] += values[idx_status] == STATUS_USED
+                report.add("orphan", ip_id, int_to_ip(ip_id), "어느 대역에도 속하지 않는 IP 행입니다(직접 추가)")
+        n += len(rows)
+        last = rows[-1][0]
+        if progress:
             progress(min(n / total_rows, 1.0), f"IP 행 검사 {n:,}/{total_rows:,}")
-    # 해시 없이 값이 바뀐 행(손대지 않은 상태가 아님)
-    for row in _scan(conn, f"SELECT id FROM ips WHERE row_hash IS NULL AND NOT ({ig.PRISTINE_SQL}) "
-                           f"AND id > ? ORDER BY id LIMIT ?"):
-        report.add("ip", row[0], int_to_ip(row[0]), "해시 없이 값이 바뀌었습니다(직접 수정)")
-    # 손대지 않은 상태로 '되돌려 놓은' 행: 이력에는 사용 기록이 있는데 행은 초기 상태
-    for row in _scan(conn, f"""
-        SELECT i.id FROM ips i WHERE i.row_hash IS NULL AND i.id > ?
-           AND EXISTS (SELECT 1 FROM history_logs h WHERE h.ip_id = i.id AND h.action <> '{ACT_INTEGRITY_REPAIR}'
-                          AND h.id > COALESCE((SELECT MAX(r.id) FROM history_logs r
-                                                WHERE r.ip_id IS NULL AND r.action = '{ACT_SUBNET_CREATE}'
-                                                  AND r.range_start BETWEEN i.id - {RANGE_LOOKBACK} AND i.id
-                                                  AND r.range_end >= i.id), 0))
-         ORDER BY i.id LIMIT ?"""):
-        report.add("ip", row[0], int_to_ip(row[0]), "사용 이력이 있는데 초기 상태로 되돌려졌습니다(직접 수정)")
-    report.checked["ips"] = n
+    _verify_reverted(conn, report)
+    report.checked["ips"] = hashed
 
     # 대역/그룹 행 해시
     for table, fields, fn, kind in (("subnets", ig.SUBNET_FIELDS, ig.subnet_row_hash, "subnet"),
@@ -414,36 +457,63 @@ def verify_rows(conn: sqlite3.Connection, report: Report, progress: Progress | N
     if progress:
         progress(1.0, "사용 통계·누락 행 검사")
 
-    # 사용 통계 카운터 + IP 누락(대역 호스트 수보다 적음)
-    for row in _scan(conn, f"""
-        SELECT s.id, s.cidr, s.prefix, s.total_count, s.used_count,
-               (SELECT COUNT(*) FROM ips WHERE ips.id BETWEEN s.network_int AND s.broadcast_int),
-               (SELECT COUNT(*) FROM ips WHERE ips.id BETWEEN s.network_int AND s.broadcast_int
-                                          AND ips.status = '{STATUS_USED}')
-          FROM subnets s WHERE s.id > ? ORDER BY s.id LIMIT ?"""):
-        sid, cidr, prefix, total_c, used_c, actual, used = row
+    # 사용 통계 카운터 + IP 누락(대역 호스트 수보다 적음) — 위에서 센 실제 개수와 대조
+    for k in sorted(range(len(subnets)), key=lambda i: subnets[i][2]):
+        _net, _bc, sid, prefix, cidr, total_c, used_c = subnets[k]
         hosts = 2 ** (32 - prefix) - (0 if prefix >= 31 else 2)
-        if actual < hosts:
-            report.add("missing", sid, cidr, f"IP 행 {hosts - actual:,}개가 없습니다(직접 삭제)")
-        if (total_c, used_c) != (actual, used):
-            report.add("count", sid, cidr, f"통계 {used_c}/{total_c} ≠ 실제 {used}/{actual}")
-    # 어느 대역에도 속하지 않거나 소속이 맞지 않는 IP 행
-    for row in _scan(conn, """
-        SELECT i.id FROM ips i LEFT JOIN subnets s ON s.id = i.subnet_id
-         WHERE i.id > ? AND (s.id IS NULL OR i.id < s.network_int OR i.id > s.broadcast_int)
-         ORDER BY i.id LIMIT ?"""):
-        report.add("orphan", row[0], int_to_ip(row[0]), "어느 대역에도 속하지 않는 IP 행입니다(직접 추가)")
+        if actual[k] < hosts:
+            report.add("missing", sid, cidr, f"IP 행 {hosts - actual[k]:,}개가 없습니다(직접 삭제)")
+        if (total_c, used_c) != (actual[k], used[k]):
+            report.add("count", sid, cidr, f"통계 {used_c}/{total_c} ≠ 실제 {used[k]}/{actual[k]}")
+
+
+def _verify_reverted(conn: sqlite3.Connection, report: Report) -> None:
+    """초기 상태로 '되돌려 놓은' IP: 이력에는 사용 기록이 있는데 행은 손대지 않은 모습(해시 없음).
+
+    해시 없는 IP(수백만 개)를 하나씩 이력과 대조하지 않고, 이력이 있는 IP 쪽에서 해시 없는 행만 골라
+    후보로 삼는다. 이력 색인을 /16 크기 구간씩 나눠 읽어 다른 사용자의 저장을 오래 막지 않는다.
+    """
+    step = 1 << 16
+    lo = 0
+    while True:
+        row = conn.execute("SELECT MIN(ip_id) FROM history_logs WHERE ip_id >= ?", (lo,)).fetchone()
+        if row is None or row[0] is None:
+            return
+        lo = row[0]
+        hi = lo + step
+        candidates = [r[0] for r in conn.execute(
+            f"SELECT DISTINCT h.ip_id FROM history_logs h JOIN ips i ON i.id = h.ip_id "
+            f"WHERE h.ip_id >= ? AND h.ip_id < ? AND i.row_hash IS NULL AND h.action <> ?",
+            (lo, hi, ACT_INTEGRITY_REPAIR))]
+        for ip_id in candidates:
+            if conn.execute(_REVERTED_SQL, {"ip": ip_id}).fetchone():
+                report.add("ip", ip_id, int_to_ip(ip_id), "사용 이력이 있는데 초기 상태로 되돌려졌습니다(직접 수정)")
+        lo = hi
+
+
+def _watched_since_start(conn: sqlite3.Connection) -> bool:
+    """처음부터 외부 수정 감시를 받아 온 DB인지(기준 검사 완료). 이런 DB는 밖에서 고친 행이 모두 dirty에 남는다."""
+    if not has_watch(conn):
+        return False
+    row = conn.execute("SELECT value FROM meta WHERE key = 'baseline'").fetchone()
+    return bool(row and row[0])
 
 
 def full_check(db_path: Path | None, anchor_path: Path | None, progress: Progress | None = None,
-               conn: sqlite3.Connection | None = None) -> Report:
-    """전체 검사. conn이 없으면 db_path로 별도 연결을 열어(백그라운드 스레드용) 검사한다."""
+               conn: sqlite3.Connection | None = None, rows: bool | None = None) -> Report:
+    """전체 검사. conn이 없으면 db_path로 별도 연결을 열어(백그라운드 스레드용) 검사한다.
+
+    rows=None(자동): 기준값 파일만 없어진 감시 중인 DB는 이력 체인 + 외부 수정 행(dirty)만 검사한다
+    (행 전체 검사는 이전 버전 DB를 처음 열 때와 백업 검증 때만).
+    """
     started = time.perf_counter()
     own = conn is None
     if own:
         conn = create_connection(db_path)       # type: ignore[arg-type]
     try:
-        report = _full_report(conn, anchor_path, progress)
+        if rows is None:
+            rows = not (anchor_path is not None and _watched_since_start(conn))
+        report = _full_report(conn, anchor_path, progress, rows)
         if report.ok:
             _write_anchor_safe(anchor_path, report)
             if anchor_path is not None and has_watch(conn):     # 기준 검사 완료 → 이후는 빠른 검사만
@@ -457,7 +527,8 @@ def full_check(db_path: Path | None, anchor_path: Path | None, progress: Progres
     return report
 
 
-def _full_report(conn: sqlite3.Connection, anchor_path: Path | None, progress: Progress | None = None) -> Report:
+def _full_report(conn: sqlite3.Connection, anchor_path: Path | None, progress: Progress | None = None,
+                 rows: bool = True) -> Report:
     ensure_not_newer(conn)
     report = Report("full")
     if has_watch(conn):
@@ -465,7 +536,11 @@ def _full_report(conn: sqlite3.Connection, anchor_path: Path | None, progress: P
     check_anchor(conn, report, anchor_path)
     total = conn.execute("SELECT MAX(id) FROM history_logs").fetchone()[0] or 0
     report.head = verify_chain(conn, report, 0, ig.GENESIS, progress, total)
-    verify_rows(conn, report, progress)
+    if rows:
+        verify_rows(conn, report, progress)
+    else:
+        verify_dirty(conn, report, tail_only_history=True)
+        report.notes.append("감시 중인 DB라 이력 체인과 외부 수정 행만 검사했습니다.")
     return report
 
 
@@ -671,8 +746,7 @@ def restore_from_backup(conn: sqlite3.Connection, backup_path: Path, tampered_di
         conn.execute("UPDATE meta SET value = value + 1000 WHERE key IN ('data_rev', 'tree_rev')")
     head = chain_head(conn)
     if anchor_path is not None:
-        anchor_path.unlink(missing_ok=True)      # 원복으로 체인이 짧아졌을 수 있으므로 새 기준값으로 교체
-        ig.write_anchor(anchor_path, *head)
+        ig.write_anchor(anchor_path, *head, force=True)    # 원복으로 체인이 짧아졌을 수 있으므로 새 기준값으로 교체
     return {"backup_head": b_id, "replayed": len(replay), "applied": applied, "manual": manual,
             "tampered_copy": str(saved)}
 

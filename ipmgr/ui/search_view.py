@@ -1,4 +1,4 @@
-"""F3 / Ctrl+F 통합 검색 모달 (IP · 호스트네임 · 담당자 · 요청번호 · 비고).
+"""F3 / Ctrl+F 전체 이력 창(최신순) + 통합 검색(IP · 호스트네임 · 담당자 · 요청번호 · 비고).
 
 검색 전에는 전체 최근 이력을 보여 준다. 처음에 RECENT_PAGE건만 읽고, 아래로 스크롤해 끝에 가까워질 때마다
 다음 RECENT_PAGE건을 이어 붙인다(이력이 수백만 건이어도 화면에 필요한 만큼만 조회).
@@ -63,7 +63,7 @@ class SearchDialog(tk.Toplevel):
         self._showing_recent = True
         self._nav: dict[str, int] = {}
         px = theme.px
-        self.title("통합 검색")
+        self.title("전체 이력")
         self.transient(parent.winfo_toplevel())
         self.geometry(f"{px(1080)}x{px(600)}")
         self.minsize(px(700), px(380))
@@ -140,7 +140,7 @@ class SearchDialog(tk.Toplevel):
     def _load_recent(self) -> None:
         self._recent_loading = True
         seq = self._seq
-        self.info.configure(text="최근 이력 불러오는 중…")
+        self.info.configure(text="전체 이력 불러오는 중…")
 
         def ok(page: dict[str, Any]) -> None:
             if seq != self._seq or not self.winfo_exists():
@@ -172,7 +172,7 @@ class SearchDialog(tk.Toplevel):
         self._recent_more = page["has_more"]
         count = len(t.get_children())
         tail = " · 아래로 스크롤하면 이전 이력을 더 불러옵니다" if self._recent_more else " · 처음 이력까지 모두 표시"
-        self.info.configure(text=f"최근 이력 {count:,}건{tail if count else ''}   —   "
+        self.info.configure(text=f"전체 이력(최신순) {count:,}건{tail if count else ''}   —   "
                                  "IP(10.1.2.3 · 10.1.2 · 10.1.0.0/16), 호스트네임, 담당자, 요청번호, 비고로 검색")
         if not count:
             self.info.configure(text="아직 이력이 없습니다. IP, 호스트네임, 담당자, 요청번호, 비고로 검색할 수 있습니다.")
@@ -206,7 +206,7 @@ class SearchDialog(tk.Toplevel):
                              one_line(r["note"]), r["cidr"], r["group_path"]))
         count = len(result["rows"])
         more = f" (상위 {SEARCH_LIMIT:,}건만 표시 — 검색어를 구체적으로 입력하세요)" if result["truncated"] else ""
-        self.info.configure(text=f"'{text}' 검색 결과 {count:,}건{more}   ·   검색어를 지우고 Enter → 최근 이력")
+        self.info.configure(text=f"'{text}' 검색 결과 {count:,}건{more}   ·   검색어를 지우고 Enter → 전체 이력")
         if count:
             first = t.get_children()[0]
             t.selection_set(first)

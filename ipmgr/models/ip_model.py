@@ -14,7 +14,7 @@ from ipmgr.logic.integrity import seal_ips, tampered_ips
 from ipmgr.logic.subnet_calc import int_to_ip, ip_prefix_range
 from ipmgr.models import group_model, subnet_model
 from ipmgr.models.common import ConflictError, ValidationError, bump_revision, now_str
-from ipmgr.models.history_model import history_page, insert_entries, ip_timeline, snapshot_entry
+from ipmgr.models.history_model import history_page, insert_entries, ip_timeline, make_entry, snapshot_entry
 
 IP_COLUMNS = ("id, subnet_id, status, hostname, allocated_date, assignee, request_no, note, "
               "version, updated_at, updated_by")
@@ -244,6 +244,110 @@ def reclaim_ips(conn: sqlite3.Connection, versions: Mapping[int, int], requester
                 "assignee": common["assignee"], "request_no": common["request_no"], "note": common["note"]}
 
     return _apply_bulk(conn, versions, STATUS_USED, build, operator, lambda _old: ACT_RECLAIM)
+
+
+# ── 불러오기(엑셀/텍스트 → 기존 대역의 IP) ─────────────────
+IMPORT_KEYS = ("status", "hostname", "assignee", "request_no", "note")
+
+
+def _has_data(row: Mapping[str, Any]) -> bool:
+    return row["status"] == STATUS_USED or any(row[k] for k in ("hostname", "assignee", "request_no", "note"))
+
+
+def plan_import(conn: sqlite3.Connection, rows: list[Any]) -> dict[str, Any]:
+    """불러올 행을 DB와 비교해 분류한다(쓰기 없음).
+
+    new: 비어 있는 IP에 새로 입력 · dup: 이미 값이 있는 IP(덮어쓸지 사용자에게 확인) ·
+    same: DB와 같아 바꿀 것 없음 · errors: (행, 사유) — 형식 오류, 등록된 대역에 없는 IP 등
+    """
+    from ipmgr.logic.importer import mark_duplicates
+    mark_duplicates(rows)
+    errors = [(r, r.error) for r in rows if r.error]
+    valid = [r for r in rows if not r.error]
+    current = get_ips(conn, [r.ip_id for r in valid])
+    new, dup, same = [], [], []
+    subnets: set[int] = set()
+    for r in valid:
+        cur = current.get(r.ip_id)
+        if cur is None:
+            errors.append((r, "등록된 대역에 없는 IP입니다(대역을 먼저 등록하세요. 네트워크·브로드캐스트 주소는 제외)"))
+            continue
+        try:
+            fields = _normalize(r.values)
+        except ValidationError as exc:
+            errors.append((r, str(exc)))
+            continue
+        r.values.update(fields)
+        subnets.add(cur["subnet_id"])
+        if all((cur[k] or "") == (r.values.get(k) or "") for k in IMPORT_KEYS):
+            same.append(r)
+        elif _has_data(cur):
+            dup.append((r, cur))
+        else:
+            new.append(r)
+    return {"new": new, "dup": dup, "same": same, "errors": errors, "subnets": len(subnets)}
+
+
+def import_ips(conn: sqlite3.Connection, rows: list[Any], overwrite: bool, operator: str, source: str,
+               today: date | None = None) -> dict[str, Any]:
+    """불러오기 실행(전체 성공 또는 전체 취소). overwrite=False면 이미 값이 있는 IP는 건너뛴다.
+
+    개별 IP는 할당/재할당/회수/정보 수정 이력으로 남고, 대역마다 '불러오기' 요약 이력을 1건씩 남긴다.
+    날짜 열이 있으면 그 날짜를 변경일로 쓰고, 없으면 상태가 바뀔 때 오늘 날짜를 기록한다.
+    """
+    from ipmgr.constants import ACT_IMPORT
+    with transaction(conn):
+        plan = plan_import(conn, rows)                      # 대화상자 이후 바뀐 내용까지 반영해 다시 분류
+        targets = plan["new"] + ([r for r, _cur in plan["dup"]] if overwrite else [])
+        if not targets:
+            return {"applied": 0, "skipped": len(plan["dup"]), "same": len(plan["same"]),
+                    "errors": len(plan["errors"])}
+        current = get_ips(conn, [r.ip_id for r in targets])
+        _guard_tampered(conn, current)
+        prior: set[int] = set()
+        ids = sorted(current)
+        for chunk in chunked(ids):
+            marks = ",".join("?" * len(chunk))
+            prior.update(r[0] for r in conn.execute(
+                f"SELECT DISTINCT ip_id FROM history_logs WHERE ip_id IN ({marks}) AND action IN (?, ?)",
+                (*chunk, ACT_ALLOCATE, ACT_REALLOCATE)))
+        ts = now_str()
+        updates, entries = [], []
+        per_subnet: dict[int, list[int]] = {}
+        for r in sorted(targets, key=lambda x: x.ip_id):
+            old = current[r.ip_id]
+            status = r.values["status"]
+            changed = sm.resolve_changed_date(old["status"], status, old["allocated_date"], today)
+            new = {"status": status, "allocated_date": r.values.get("allocated_date") or changed,
+                   **{k: r.values.get(k, "") for k in ("hostname", "assignee", "request_no", "note")}}
+            action = sm.determine_action(old["status"], status, r.ip_id in prior)
+            updates.append((new["status"], new["hostname"], new["allocated_date"], new["assignee"],
+                            new["request_no"], new["note"], ts, operator, r.ip_id, old["version"]))
+            entries.append(snapshot_entry({**old, **new}, action=action, old_status=old["status"],
+                                          new_status=status, ip_address=old["ip_address"],
+                                          diff_summary=sm.build_diff_summary(old, new), operator=operator,
+                                          timestamp=ts))
+            per_subnet.setdefault(old["subnet_id"], []).append(r.ip_id)
+        cur = conn.executemany("""
+            UPDATE ips SET status = ?, hostname = ?, allocated_date = ?, assignee = ?, request_no = ?, note = ?,
+                           version = version + 1, updated_at = ?, updated_by = ?
+             WHERE id = ? AND version = ?
+        """, updates)
+        if cur.rowcount != len(updates):
+            raise ConflictError("다른 사용자가 동시에 수정했습니다. 다시 불러오기를 해 주세요.")
+        seal_ips(conn, list(current))
+        overwritten = {r.ip_id for r, _c in plan["dup"]} if overwrite else set()
+        for sid, ip_ids in sorted(per_subnet.items()):
+            cidr_row = conn.execute("SELECT cidr FROM subnets WHERE id = ?", (sid,)).fetchone()
+            n_over = sum(1 for i in ip_ids if i in overwritten)
+            entries.append(make_entry(
+                subnet_id=sid, ip_address=cidr_row[0] if cidr_row else "", action=ACT_IMPORT, operator=operator,
+                timestamp=ts, diff_summary=f"{source}에서 {len(ip_ids):,}건 불러오기 "
+                                           f"(새로 입력 {len(ip_ids) - n_over:,}건, 덮어쓰기 {n_over:,}건)"))
+        insert_entries(conn, entries)
+        bump_revision(conn)
+    return {"applied": len(updates), "skipped": 0 if overwrite else len(plan["dup"]), "same": len(plan["same"]),
+            "errors": len(plan["errors"]), "subnets": len(per_subnet)}
 
 
 # ── 통합 검색 ──────────────────────────────────────────────

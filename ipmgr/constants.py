@@ -64,6 +64,7 @@ ACT_GROUP_UPDATE: Final = "그룹 수정"
 ACT_GROUP_MOVE: Final = "그룹 이동"
 ACT_GROUP_DELETE: Final = "그룹 삭제"
 ACT_INTEGRITY_REPAIR: Final = "무결성 복구"
+ACT_IMPORT: Final = "불러오기"            # 대역 단위 요약 이력(개별 IP는 할당/재할당/회수/정보 수정으로 기록)
 
 # ── 무결성/백업 파일 ───────────────────────────────────────
 ANCHOR_FILE_NAME: Final = "IP관리.anchor"          # 검증된 이력 체인 끝 지점(DB 밖 기준값)

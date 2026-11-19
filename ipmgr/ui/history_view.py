@@ -28,7 +28,6 @@ _LABELS = "|".join(re.escape(v) for v in (*FIELD_LABELS.values(), "할당일"))
 _DIFF_RE = re.compile(rf"^({_LABELS}): (.*) → (.*)$", re.S)
 FIELD_ORDER = ["상태", "호스트네임", "담당자", "요청번호", "비고", "변경일", "할당일"]
 DATE_LABELS = ("변경일", "할당일")
-STATUS_ACTIONS = (ACT_ALLOCATE, ACT_REALLOCATE, ACT_RECLAIM)
 
 
 def parse_diff(summary: str) -> list[tuple[str, str, str]] | None:
@@ -153,17 +152,9 @@ class HistoryTimeline(ttk.Frame):
             if diff is None:
                 chunks.extend(self._kv("내용", [(e["diff_summary"], "plain")]))
             else:
-                if e["action"] in STATUS_ACTIONS and not any(lbl in DATE_LABELS for lbl, _b, _a in diff) \
-                        and e["allocated_date"]:
-                    # 같은 날 회수 후 재할당 등 날짜가 그대로여도 언제 바뀌었는지 시각을 보여준다
-                    diff.append(("변경일", e["allocated_date"], e["allocated_date"]))
                 for label, before, after in diff:
                     if label in DATE_LABELS:
-                        stamp = f" {e['timestamp'][11:16]}" if after and after == e["timestamp"][:10] else ""
-                        if before == after:
-                            chunks.extend(self._kv(label, [(after + stamp, "new")]))
-                            continue
-                        after = (after + stamp) if after else after
+                        continue                         # 변경 일시는 카드 제목줄에 이미 있으므로 생략
                     if "\n" in before + after:          # 여러 줄 비고: 이전 / 이후를 각각 블록으로
                         chunks.extend(self._kv(label, [(before or "(없음)", "old")]))
                         chunks.extend(self._kv("", [("→  ", "arrow"), (after or "(없음)", "new")]))

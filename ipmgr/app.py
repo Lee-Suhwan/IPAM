@@ -147,12 +147,18 @@ class App:
                 return "break"
             return wrapped
 
-        for seq in ("<F3>", "<Control-f>", "<Control-F>"):
-            self.root.bind_all(seq, main_only(w.open_search))
+        self.root.bind_all("<F3>", main_only(w.open_search))
         self.root.bind_all("<F5>", main_only(w.refresh_all))
         self.root.bind_all("<Escape>", main_only(w.escape))
-        for seq in ("<Control-e>", "<Control-E>"):
-            self.root.bind_all(seq, main_only(w.export_excel))
+        # Ctrl+F(전체 이력) / Ctrl+E(Excel): 한글 입력 상태에서는 글자가 'ㄹ'·'ㄷ'로 들어와 <Control-f>가
+        # 동작하지 않으므로 자판 배치와 무관한 키 코드(Windows 가상 키)로 판단한다.
+        by_key = {70: main_only(w.open_search), 69: main_only(w.export_excel)}
+
+        def ctrl_key(event: tk.Event) -> str | None:
+            handler = by_key.get(event.keycode)
+            return handler(event) if handler else None
+
+        self.root.bind_all("<Control-KeyPress>", ctrl_key)
         w.tree.tree.bind("<Delete>", lambda e: w.delete_node())
 
     # ── 루프 ────────────────────────────────────────────
